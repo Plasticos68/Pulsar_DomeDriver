@@ -1815,55 +1815,339 @@ namespace Pulsar_DomeDriver.Driver
 
         #endregion
 
-    //    private void ExecuteCommand(
-    //DomeCommandIntent intent,
-    //string command,
-    //string action,
-    //string longAction,
-    //Func<bool> alreadyComplete,
-    //Func<ActionWatchdog.WatchdogResult> checkStatus,
-    //int timeoutMs)
-    //    {
-    //        _config.ForceBusy = true;
-    //        _lastIntent = intent;
-
-    //        LogDome($"{action}...");
-
-    //        bool pollingWasStopped = StopPolling();
-    //        if (pollingWasStopped)
-    //        {
-    //            _pollingTask?.Wait(Timeouts.PollingTaskWait);
-    //            Thread.Sleep(Timeouts.SerialBufferSettle);
-    //        }
-
-    //        try
-    //        {
-    //            if (alreadyComplete())
-    //            {
-    //                _logger?.Log($"Already complete — skipping {action}.", LogLevel.Info);
-    //                _config.ForceBusy = false;
-    //                StartPolling();
-    //                return;
-    //            }
-
-    //            if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-    //            {
-    //                _logger?.Log($"{action} command failed: No match response.", LogLevel.Error);
-    //                RaiseAlarmAndReset($"{action} command failed (no ACK).");
-    //                return;
-    //            }
-
-    //            // ... rest of common logic
-    //        }
-    //        finally
-    //        {
-    //            StartPolling();
-    //        }
-    //    }
-
         #region Ascom Actions
 
-        public void AbortSlew()
+        private void ExecuteDomeCommand(
+    string command,
+    string message,
+    int timeoutMs,
+    DomeCommandIntent intent,
+    Func<bool> alreadyAtTarget,
+    Action updateConfigBeforeWatchdog,
+    Func<ActionWatchdog.WatchdogResult> checkStatus,
+    string mqttTopic,
+    string mqttSuccess,
+    string mqttFail,
+    string actionLabel,
+    string longAction,
+    string? gnsOverride = null,
+    double? gnsTimeoutFactor = null)
+        {
+            _config.ForceBusy = true;
+            _lastIntent = intent;
+
+            LogDome(message);
+
+            if (gnsOverride != null || gnsTimeoutFactor != null)
+            {
+                int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * (gnsTimeoutFactor ?? 3.5));
+                _GNS.SendGNS(GNSType.New, gnsOverride ?? message, gnsTimeout);
+            }
+
+            bool pollingWasStopped = StopPolling();
+            if (pollingWasStopped)
+            {
+                _pollingTask?.Wait(1000);
+                Thread.Sleep(60);
+            }
+
+            try
+            {
+                if (alreadyAtTarget())
+                {
+                    _logger?.Log("Already at target — skipping command and watchdog.", LogLevel.Info);
+                    _config.ForceBusy = false;
+                    StartPolling();
+                    return;
+                }
+
+                if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
+                {
+                    _logger?.Log($"{actionLabel} command failed: No match response.", LogLevel.Error);
+                    RaiseAlarmAndReset($"{actionLabel} command failed (no ACK).");
+                    return;
+                }
+
+                lock (_pollingLock)
+                {
+                    updateConfigBeforeWatchdog();
+                }
+
+                int waitMs = 0;
+                while (!_config.ControllerReady && waitMs < 10000)
+                {
+                    Thread.Sleep(500);
+                    waitMs += 500;
+                }
+
+                if (!_config.ControllerReady)
+                {
+                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
+                    RaiseAlarmAndReset($"Controller not ready after {actionLabel}; initiating recovery.");
+                    return;
+                }
+
+                StartActionWatchdog(
+                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
+                    action: actionLabel,
+                    longAction: longAction,
+                    checkStatus: checkStatus,
+                    mqttTopic: mqttTopic,
+                    mqttSuccess: mqttSuccess,
+                    mqttFail: mqttFail
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger?.Log($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+            }
+            finally
+            {
+                StartPolling();
+            }
+        }
+
+        private void StartActionWatchdog(
+    TimeSpan timeout,
+    string action,
+    string longAction,
+    Func<ActionWatchdog.WatchdogResult> checkStatus,
+    string mqttTopic,
+    string mqttSuccess,
+    string mqttFail)
+        {
+            var cts = new CancellationTokenSource();
+
+            // Dispose previous CTS safely
+            try { _actionWatchdogCts?.Dispose(); } catch { }
+            _actionWatchdogCts = cts;
+
+            // Increment generation to track this watchdog instance
+            int generation = Interlocked.Increment(ref _watchdogGeneration);
+
+            var watchdog = new ActionWatchdog(
+                config: _config,
+                timeout: timeout,
+                action: action,
+                longAction: longAction,
+                checkStatus: checkStatus,
+                internalCts: cts,
+                resetRoutine: async () => await ResetRoutineAsync(),
+                mqttPublisher: _mqttPublisher,
+                mqttTopic: mqttTopic,
+                mqttSuccess: mqttSuccess,
+                mqttFail: mqttFail
+            );
+
+            _actionWatchdog = watchdog;
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await watchdog.Start();
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Log($"Watchdog error ({action}): {ex.Message}", LogLevel.Error);
+                }
+                finally
+                {
+                    // Only clear if this is the latest generation
+                    if (Interlocked.CompareExchange(ref _watchdogGeneration, generation, generation) == generation)
+                    {
+                        _actionWatchdog = null;
+
+                        if (_actionWatchdogCts == cts)
+                        {
+                            try { _actionWatchdogCts?.Dispose(); } catch { }
+                            _actionWatchdogCts = null;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Centralize: raise alarm via GNS + MQTT and kick off reset
+        private void RaiseAlarmAndReset(string alarmMessage)
+        {
+            _GNS.SendGNS(GNSType.Alarm, alarmMessage);
+            TryMQTTPublish(_mqttAlarm, alarmMessage);
+            _logger?.Log($"[ALARM] {alarmMessage}", LogLevel.Error);
+            _config.ForceBusy = true;
+            _ = Task.Run(async () => await ResetRoutineAsync());
+        }
+
+        public void OpenShutter()
+        {
+            string message = "Opening shutter...";
+            LogShutter(message);
+
+            ExecuteDomeCommand(
+                command: "OPEN",
+                message: message,
+                timeoutMs: _config.ShutterTimeout,
+                intent: DomeCommandIntent.OpenShutter,
+                alreadyAtTarget: () => _config.ShutterStatus == 0,
+                updateConfigBeforeWatchdog: () =>
+                {
+                    _config.ShutterStatus = 1; // opening
+                    _config.SlewingStatus = true;
+                },
+                checkStatus: () => _config.ShutterStatus switch
+                {
+                    0 => ActionWatchdog.WatchdogResult.Success,
+                    4 => ActionWatchdog.WatchdogResult.Error,
+                    5 => ActionWatchdog.WatchdogResult.Failure,
+                    _ => ActionWatchdog.WatchdogResult.InProgress
+                },
+                mqttTopic: _mqttShutterStatus,
+                mqttSuccess: "Shutter is open.",
+                mqttFail: "Shutter failed to open.",
+                actionLabel: "open shutter",
+                longAction: "Shutter opening..."
+            );
+        }
+
+        public void CloseShutter()
+        {
+            string message = "Closing shutter...";
+            LogShutter(message);
+
+            ExecuteDomeCommand(
+                command: "CLOSE",
+                message: message,
+                timeoutMs: _config.ShutterTimeout,
+                intent: DomeCommandIntent.CloseShutter,
+                alreadyAtTarget: () => _config.ShutterStatus == 1,
+                updateConfigBeforeWatchdog: () =>
+                {
+                    _config.ShutterStatus = 3; // closing
+                    _config.SlewingStatus = true;
+                },
+                checkStatus: () => _config.ShutterStatus switch
+                {
+                    1 => ActionWatchdog.WatchdogResult.Success,
+                    4 => ActionWatchdog.WatchdogResult.Error,
+                    5 => ActionWatchdog.WatchdogResult.Failure,
+                    _ => ActionWatchdog.WatchdogResult.InProgress
+                },
+                mqttTopic: _mqttShutterStatus,
+                mqttSuccess: "Shutter is closed.",
+                mqttFail: "Shutter failed to close.",
+                actionLabel: "close shutter",
+                longAction: "Shutter closing..."
+            );
+        }
+
+        public void SlewToAzimuth(double azimuth)
+        {
+            if (azimuth < 0 || azimuth >= 360)
+                throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
+
+            double changeAzimuth = Math.Abs(azimuth - _config.Azimuth);
+            string message = $"Slewing to Azimuth {azimuth}...";
+            string command = $"ABS {azimuth}";
+            LogDome(message);
+
+            ExecuteDomeCommand(
+                command: command,
+                message: message,
+                timeoutMs: _config.RotationTimeout,
+                intent: DomeCommandIntent.SlewAzimuth,
+                alreadyAtTarget: () => Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance,
+                updateConfigBeforeWatchdog: () =>
+                {
+                    _config.DomeState = 1;
+                    _config.SlewingStatus = true;
+                },
+                checkStatus: () =>
+                {
+                    if (_config.DomeState == 0 && Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
+                        return ActionWatchdog.WatchdogResult.Success;
+
+                    if (_config.DomeState == 1 || Math.Abs(_config.Azimuth - azimuth) >= _config.AzimuthTolerance)
+                        return ActionWatchdog.WatchdogResult.InProgress;
+
+                    return ActionWatchdog.WatchdogResult.Failure;
+                },
+                mqttTopic: _mqttDomeStatus,
+                mqttSuccess: $"Dome reached azimuth {azimuth}.",
+                mqttFail: $"Dome failed to reach azimuth {azimuth}.",
+                actionLabel: "goto azimuth",
+                longAction: $"Slewing to azimuth {azimuth}...",
+                gnsOverride: changeAzimuth > _config.JogSize ? message : null,
+                gnsTimeoutFactor: changeAzimuth > _config.JogSize ? 2.5 : null
+            );
+        }
+
+        public void FindHome()
+        {
+            string message = "Finding Home...";
+            int timeoutMs = _config.RotationTimeout;
+            LogDome(message);
+
+            ExecuteDomeCommand(
+                command: "GO H",
+                message: message,
+                timeoutMs: timeoutMs,
+                intent: DomeCommandIntent.GoHome,
+                alreadyAtTarget: () => _config.HomeStatus,
+                updateConfigBeforeWatchdog: () =>
+                {
+                    _config.DomeState = 9; // going home
+                    _config.SlewingStatus = true;
+                },
+                checkStatus: () =>
+                {
+                    return _config.HomeStatus
+                        ? ActionWatchdog.WatchdogResult.Success
+                        : ActionWatchdog.WatchdogResult.InProgress;
+                },
+                mqttTopic: _mqttDomeStatus,
+                mqttSuccess: "Dome is at home.",
+                mqttFail: "Dome failed to find home.",
+                actionLabel: "home",
+                longAction: "Finding home...",
+                gnsOverride: message,
+                gnsTimeoutFactor: 2.5
+            );
+        }
+
+        public void Park()
+        {
+            string message = "Parking...";
+            int timeoutMs = _config.RotationTimeout;
+            LogDome(message);
+
+            ExecuteDomeCommand(
+                command: "GO P",
+                message: message,
+                timeoutMs: timeoutMs,
+                intent: DomeCommandIntent.Park,
+                alreadyAtTarget: () => _config.ParkStatus,
+                updateConfigBeforeWatchdog: () =>
+                {
+                    _config.DomeState = 1; // moving to target (park)
+                    _config.SlewingStatus = true;
+                },
+                checkStatus: () =>
+                {
+                    return _config.ParkStatus
+                        ? ActionWatchdog.WatchdogResult.Success
+                        : ActionWatchdog.WatchdogResult.InProgress;
+                },
+                mqttTopic: _mqttDomeStatus,
+                mqttSuccess: "Dome is parked.",
+                mqttFail: "Dome failed to park.",
+                actionLabel: "Park",
+                longAction: "Parking...",
+                gnsOverride: message,
+                gnsTimeoutFactor: 2.5
+            );
+        }
+
+       public void AbortSlew()
         {
             LogDomeStatus("Aborting all movement...", "Aborting all movement...");
 
@@ -1920,865 +2204,11 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
-        public void OpenShutter()
-        {
-            string message = "Opening shutter...";
-            int timeoutMs = _config.ShutterTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.OpenShutter;
-
-            LogShutter(message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 3.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.ShutterStatus == 0)
-                {
-                    _logger?.Log("Already open — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                // 1) Command did not return the expected ACK
-                if (!SendAndVerify("OPEN", ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log("Open command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset("Open shutter command failed (no ACK).");
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.ShutterStatus = 2; // opening
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset("Controller not ready after OPEN; initiating recovery.");
-                    return;
-                }
-
-                StartActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "open shutter",
-                    longAction: "Shutter opening...",
-                    checkStatus: () =>
-                    {
-                        return _config.ShutterStatus switch
-                        {
-                            0 => ActionWatchdog.WatchdogResult.Success,
-                            4 => ActionWatchdog.WatchdogResult.Error,
-                            5 => ActionWatchdog.WatchdogResult.Failure,
-                            _ => ActionWatchdog.WatchdogResult.InProgress
-                        };
-                    },
-                    mqttTopic: _mqttShutterStatus,
-                    mqttSuccess: "Shutter is open.",
-                    mqttFail: "Shutter failed to open."
-                );
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"OpenShutter command failed: {ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                StartPolling(); // resume polling/watchdog updates
-            }
-        }
-
-        public void CloseShutter()
-        {
-            string message = "Closing shutter...";
-            int timeoutMs = _config.ShutterTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.CloseShutter;
-
-            LogShutter(message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 3.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.ShutterStatus == 1)
-                {
-                    _logger?.Log("Already closed — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                // 1) Command did not return the expected ACK
-                if (!SendAndVerify("CLOSE", ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log("Close command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset("Close shutter command failed (no ACK).");
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.ShutterStatus = 3; // closing
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset("Controller not ready after OPEN; initiating recovery.");
-                    return;
-                }
-
-                StartActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "close shutter",
-                    longAction: "Shutter closing...",
-                    checkStatus: () =>
-                    {
-                        return _config.ShutterStatus switch
-                        {
-                            1 => ActionWatchdog.WatchdogResult.Success,
-                            4 => ActionWatchdog.WatchdogResult.Error,
-                            5 => ActionWatchdog.WatchdogResult.Failure,
-                            _ => ActionWatchdog.WatchdogResult.InProgress
-                        };
-                    },
-                    mqttTopic: _mqttShutterStatus,
-                    mqttSuccess: "Shutter is closing.",
-                    mqttFail: "Shutter failed to close."
-                );
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"CloseShutter command failed: {ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                StartPolling(); // resume polling/watchdog updates
-            }
-        }
-
-        public void SlewToAzimuth(double azimuth)
-        {
-            if (azimuth < 0 || azimuth >= 360)
-                throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
-
-            string message = $"Slewing to Azimuth {azimuth}...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _config.SlewAz = azimuth;
-            _lastIntent = DomeCommandIntent.SlewAzimuth;
-
-            LogDome(message);
-
-            // only message gns if it's a proper goto rather than a jog
-            double oldAzimuth = _config.Azimuth;
-
-            changeAzimuth = Math.Abs(azimuth - oldAzimuth);
-            if (changeAzimuth > _config.JogSize)
-            {
-                int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-                _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-            }
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
-                {
-                    _logger?.Log("Already at target azimuth — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                string toSend = $"ABS {azimuth}";
-                // 1) Command did not return the expected ACK
-                if (!SendAndVerify(toSend, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log("Open command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset("Open shutter command failed (no ACK).");
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 1; // moving to target
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset("Controller not ready after goto azimuth; initiating recovery.");
-                    return;
-                }
-
-                StartActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "goto azimuth",
-                    longAction: $"Slewing to azimuth {azimuth}...",
-                    checkStatus: () =>
-                    {
-                        if (_config.DomeState == 0 && Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
-                            return ActionWatchdog.WatchdogResult.Success;
-
-                        if (_config.DomeState == 1 || Math.Abs(_config.Azimuth - azimuth) >= _config.AzimuthTolerance)
-                            return ActionWatchdog.WatchdogResult.InProgress;
-
-                        return ActionWatchdog.WatchdogResult.Failure;
-                    },
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: $"Dome reached azimuth {azimuth}.",
-                    mqttFail: $"Dome failed to reach azimuth {azimuth}."
-                );
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"SlewToAzimuth command failed: {ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                StartPolling(); // resume polling/watchdog updates
-            }
-        }
-
-        public void oldSlewToAzimuth(double azimuth)
-        {
-            if (azimuth < 0 || azimuth >= 360)
-                throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
-
-            string message = $"Slewing to Azimuth {azimuth}...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _config.SlewAz = azimuth;
-            _lastIntent = DomeCommandIntent.SlewAzimuth;
-
-            LogDomeStatus(message, "");
-
-            // only message gns if it's a proper goto rather than a jog
-            double oldAzimuth = _config.Azimuth;
-
-            changeAzimuth = Math.Abs(azimuth - oldAzimuth);
-            if (changeAzimuth > _config.JogSize)
-            {
-                int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-                _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-            }
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
-                {
-                    _logger?.Log("Already at target azimuth — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                string toSend = $"ABS {azimuth}";
-                bool success = SendAndVerify(toSend, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch;
-
-                // 1) Command did not return the expected ACK
-                if (!success)
-                {
-                    _logger?.Log("Goto azimuth command failed: No match response.", LogLevel.Error);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Goto azimuth command failed (no ACK).");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 1; // moving to target
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Controller not ready after goto azimuth; initiating recovery.");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                // create per-action CTS and watchdog
-                var cts = new CancellationTokenSource();
-                _actionWatchdogCts?.Dispose();
-                _actionWatchdogCts = cts;
-
-                var watchdog = new ActionWatchdog(
-                    config: _config,
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "goto azimuth",
-                    longAction: $"Slewing to azimuth {azimuth}...",
-                    internalCts: cts,
-                    checkStatus: () =>
-                    {
-                        if (_config.DomeState == 0 && Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
-                            return ActionWatchdog.WatchdogResult.Success;
-
-                        if (_config.DomeState == 1 || Math.Abs(_config.Azimuth - azimuth) >= _config.AzimuthTolerance)
-                            return ActionWatchdog.WatchdogResult.InProgress;
-
-                        return ActionWatchdog.WatchdogResult.Failure;
-                    },
-                    resetRoutine: async () => await ResetRoutineAsync(),
-                    mqttPublisher: _mqttPublisher,
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: $"Dome reached azimuth {azimuth}.",
-                    mqttFail: $"Dome failed to reach azimuth {azimuth}."
-                );
-                _actionWatchdog = watchdog;
-
-                Task.Run(async () =>
-                {
-                    try
-                    {
-                        await watchdog.Start();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.Log($"Watchdog error: {ex.Message}", LogLevel.Error);
-                    }
-                    finally
-                    {
-                        // only clear/cleanup if this task still owns the fields
-                        if (ReferenceEquals(_actionWatchdog, watchdog)) _actionWatchdog = null;
-                        if (ReferenceEquals(_actionWatchdogCts, cts))
-                        {
-                            _actionWatchdogCts?.Dispose();
-                            _actionWatchdogCts = null;
-                        }
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"SlewToAzimuth command failed: {ex.Message}", LogLevel.Error);
-            }
-
-            StartPolling(); // resume polling after watchdog launch
-        }
-
         public void SyncToAzimuth(double azimuth)
         {
             _logger?.Log($"SyncToAzimuth called with altitude = {azimuth} — not supported.", LogLevel.Debug);
             throw new ASCOM.MethodNotImplementedException("SyncToAzimuth is not supported by this dome.");
 
-        }
-
-        public void FindHome()
-        {
-            string message = "Finding Home...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.GoHome;
-
-            LogDome(message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.HomeStatus)
-                {
-                    _logger?.Log("Already home — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                // 1) Command did not return the expected ACK
-                if (!SendAndVerify("GO H", ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log("Home command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset("Home command failed (no ACK).");
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 9; // going home
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset("Controller not ready after home; initiating recovery.");
-                    return;
-                }
-
-                StartActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "home",
-                    longAction: "Finding home...",
-                    checkStatus: () =>
-                    {
-                        return _config.HomeStatus
-                            ? ActionWatchdog.WatchdogResult.Success
-                            : ActionWatchdog.WatchdogResult.InProgress;
-                    },
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: "Dome is at home.",
-                    mqttFail: "Dome failed to find home."
-                );
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"Home command failed: {ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                StartPolling(); // resume polling/watchdog updates
-            }
-        }
-
-        public void oldFindHome()
-        {
-            string message = "Finding Home...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.GoHome;
-
-            LogDomeStatus("", message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.HomeStatus)
-                {
-                    _logger?.Log("Already home — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                string toSend = "GO H";
-                bool success = SendAndVerify(toSend, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch;
-
-                // 1) Command did not return the expected ACK
-                if (!success)
-                {
-                    _logger?.Log("Home command failed: No match response.", LogLevel.Error);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Home command failed (no ACK).");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 9; // going home
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Controller not ready after home command; initiating recovery.");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                // create per-action CTS and watchdog
-                var cts = new CancellationTokenSource();
-                _actionWatchdogCts?.Dispose();
-                _actionWatchdogCts = cts;
-
-                var watchdog = new ActionWatchdog(
-                    config: _config,
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "home",
-                    longAction: "Finding home...",
-                    internalCts: cts,
-                    checkStatus: () =>
-                    {
-                        return _config.HomeStatus
-                            ? ActionWatchdog.WatchdogResult.Success
-                            : ActionWatchdog.WatchdogResult.InProgress;
-                    },
-                    resetRoutine: async () => await ResetRoutineAsync(),
-                    mqttPublisher: _mqttPublisher,
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: "Dome is at home.",
-                    mqttFail: "Dome failed to find home."
-                );
-                _actionWatchdog = watchdog;
-
-                Task.Run(async () =>
-                {
-                    try
-                    {
-                        await watchdog.Start();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.Log($"Watchdog error: {ex.Message}", LogLevel.Error);
-                    }
-                    finally
-                    {
-                        // only clear/cleanup if this task still owns the fields
-                        if (ReferenceEquals(_actionWatchdog, watchdog)) _actionWatchdog = null;
-                        if (ReferenceEquals(_actionWatchdogCts, cts))
-                        {
-                            _actionWatchdogCts?.Dispose();
-                            _actionWatchdogCts = null;
-                        }
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"FindHome command failed: {ex.Message}", LogLevel.Error);
-            }
-
-            StartPolling(); // resume polling after watchdog launch
-        }
-
-        public void Park()
-        {
-            string message = "Parking...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.Park;
-
-            LogDome(message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.ParkStatus)
-                {
-                    _logger?.Log("Already parked — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                // 1) Command did not return the expected ACK
-                if (!SendAndVerify("GO P", ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log("Park command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset("Park command failed (no ACK).");
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 1; // slewing (to park)
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset("Controller not ready after park; initiating recovery.");
-                    return;
-                }
-
-                StartActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "park",
-                    longAction: "Parking...",
-                    checkStatus: () =>
-                    {
-                        return _config.ParkStatus
-                            ? ActionWatchdog.WatchdogResult.Success
-                            : ActionWatchdog.WatchdogResult.InProgress;
-                    },
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: "Dome is parked.",
-                    mqttFail: "Dome failed to park."
-                );
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"Park command failed: {ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                StartPolling(); // resume polling/watchdog updates
-            }
-        }
-
-        public void oldPark()
-        {
-            string message = "Parking...";
-            int timeoutMs = _config.RotationTimeout;
-
-            _config.ForceBusy = true;
-            _lastIntent = DomeCommandIntent.Park;
-
-            LogDomeStatus("", message);
-            int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * 2.5);
-            _GNS.SendGNS(GNSType.New, message, gnsTimeout);
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000); // safer than spin-loop
-                Thread.Sleep(60);         // allow serial buffer to settle
-            }
-
-            try
-            {
-                if (_config.ParkStatus)
-                {
-                    _logger?.Log("Already parked — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
-                    return;
-                }
-
-                string toSend = "GO P";
-                bool success = SendAndVerify(toSend, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch;
-
-                // 1) Command did not return the expected ACK
-                if (!success)
-                {
-                    _logger?.Log("Park command failed: No match response.", LogLevel.Error);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Park command failed (no ACK).");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                lock (_pollingLock)
-                {
-                    _config.DomeState = 1; // slewing (to park)
-                    _config.SlewingStatus = true;
-                }
-
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                // 2) Controller not ready after wait window
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-
-                    _GNS.SendGNS(GNSType.Alarm, "Controller not ready after park command; initiating recovery.");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    // Keep presenting busy, initiate recovery
-                    _config.ForceBusy = true;
-                    _ = Task.Run(async () => await ResetRoutineAsync());
-
-                    return;
-                }
-
-                // create per-action CTS and watchdog
-                var cts = new CancellationTokenSource();
-                _actionWatchdogCts?.Dispose();
-                _actionWatchdogCts = cts;
-
-                var watchdog = new ActionWatchdog(
-                    config: _config,
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: "parking",
-                    longAction: "Parking...",
-                    internalCts: cts,
-                    checkStatus: () =>
-                    {
-                        return _config.ParkStatus
-                            ? ActionWatchdog.WatchdogResult.Success
-                            : ActionWatchdog.WatchdogResult.InProgress;
-                    },
-                    resetRoutine: async () => await ResetRoutineAsync(),
-                    mqttPublisher: _mqttPublisher,
-                    mqttTopic: _mqttDomeStatus,
-                    mqttSuccess: "Dome is parked.",
-                    mqttFail: "Dome failed to park."
-                );
-                _actionWatchdog = watchdog;
-
-                Task.Run(async () =>
-                {
-                    try
-                    {
-                        await watchdog.Start();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.Log($"Watchdog error: {ex.Message}", LogLevel.Error);
-                    }
-                    finally
-                    {
-                        // only clear/cleanup if this task still owns the fields
-                        if (ReferenceEquals(_actionWatchdog, watchdog)) _actionWatchdog = null;
-                        if (ReferenceEquals(_actionWatchdogCts, cts))
-                        {
-                            _actionWatchdogCts?.Dispose();
-                            _actionWatchdogCts = null;
-                        }
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger?.Log($"Park command failed: {ex.Message}", LogLevel.Error);
-            }
-
-            StartPolling(); // resume polling after watchdog launch
         }
 
         public void Unpark()
@@ -2803,17 +2233,6 @@ namespace Pulsar_DomeDriver.Driver
 
         #region Action helpers
 
-        // Centralize: raise alarm via GNS + MQTT and kick off reset
-        private void RaiseAlarmAndReset(string alarmMessage)
-        {
-            _GNS.SendGNS(GNSType.Alarm, alarmMessage);
-
-            TryMQTTPublish(_mqttAlarm, alarmMessage);
-
-            _config.ForceBusy = true; // keep client seeing activity
-            _ = Task.Run(async () => await ResetRoutineAsync());
-        }
-
         // Fully cancel and clear any active action watchdog
         private void CancelCurrentActionWatchdog()
         {
@@ -2825,70 +2244,6 @@ namespace Pulsar_DomeDriver.Driver
             _actionWatchdogCts = null;
 
             _config.WatchdogRunning = false;
-        }
-
-        // Start a new action watchdog with CTS handover and race-free cleanup
-
-
-        private void StartActionWatchdog(
-            TimeSpan timeout,
-            string action,
-            string longAction,
-            Func<ActionWatchdog.WatchdogResult> checkStatus,
-            string mqttTopic,
-            string mqttSuccess,
-            string mqttFail)
-        {
-            var cts = new CancellationTokenSource();
-
-            // Dispose previous CTS safely
-            try { _actionWatchdogCts?.Dispose(); } catch { }
-            _actionWatchdogCts = cts;
-
-            // Increment generation to track this watchdog instance
-            int generation = Interlocked.Increment(ref _watchdogGeneration);
-
-            var watchdog = new ActionWatchdog(
-                config: _config,
-                timeout: timeout,
-                action: action,
-                longAction: longAction,
-                checkStatus: checkStatus,
-                internalCts: cts,
-                resetRoutine: async () => await ResetRoutineAsync(),
-                mqttPublisher: _mqttPublisher,
-                mqttTopic: mqttTopic,
-                mqttSuccess: mqttSuccess,
-                mqttFail: mqttFail
-            );
-
-            _actionWatchdog = watchdog;
-
-            Task.Run(async () =>
-            {
-                try
-                {
-                    await watchdog.Start();
-                }
-                catch (Exception ex)
-                {
-                    _logger?.Log($"Watchdog error ({action}): {ex.Message}", LogLevel.Error);
-                }
-                finally
-                {
-                    // Only clear if this is the latest generation
-                    if (Interlocked.CompareExchange(ref _watchdogGeneration, generation, generation) == generation)
-                    {
-                        _actionWatchdog = null;
-
-                        if (_actionWatchdogCts == cts)
-                        {
-                            try { _actionWatchdogCts?.Dispose(); } catch { }
-                            _actionWatchdogCts = null;
-                        }
-                    }
-                }
-            });
         }
 
         // Convenience wrappers to keep status logs consistent
