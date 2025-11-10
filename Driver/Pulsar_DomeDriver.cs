@@ -15,13 +15,9 @@ using System.Globalization;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
-using System.Net.Mail;
 using System.Runtime.InteropServices;
-using System.Runtime.Remoting.Messaging;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 using SerialPortGuard = Pulsar_DomeDriver.Helper.SerialPortGuard;
 
 namespace Pulsar_DomeDriver.Driver
@@ -1836,8 +1832,6 @@ namespace Pulsar_DomeDriver.Driver
             _config.ForceBusy = true;
             _lastIntent = intent;
 
-            LogDome(message);
-
             if (gnsOverride != null || gnsTimeoutFactor != null)
             {
                 int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * (gnsTimeoutFactor ?? 3.5));
@@ -1845,6 +1839,7 @@ namespace Pulsar_DomeDriver.Driver
             }
 
             bool pollingWasStopped = StopPolling();
+
             if (pollingWasStopped)
             {
                 _pollingTask?.Wait(1000);
