@@ -60,6 +60,7 @@ namespace Pulsar_DomeDriver.Driver
         private readonly TimeSpan _pollingStallThreshold = TimeSpan.FromSeconds(10);
         private volatile bool _commandInProgress = false;
         private bool _rebooting = false;
+        private int _watchdogGeneration = 0;
 
         // Dome/Shutter status variables
         private string oldDomeActivity;
@@ -254,23 +255,12 @@ namespace Pulsar_DomeDriver.Driver
                 throw new ASCOM.NotConnectedException("Serial port name is missing. Please run Setup.");
             }
 
-            if (_port == null)
-                throw new ASCOM.NotConnectedException("Serial port is not initialized.");
-
             if (!_port.IsOpen)
             {
                 try
                 {
                     _port.Open();
                     _logger?.Log($"Serial port {_port.PortName} opened.", LogLevel.Info);
-
-                    // Create the guard immediately after opening
-                    _guard = new SerialPortGuard(
-                        _port,
-                        _logger,
-                        () => { lock (_pollingLock) { _commandInProgress = true; } },
-                        () => { lock (_pollingLock) { _commandInProgress = false; } }
-                    );
                 }
                 catch (Exception ex)
                 {
@@ -279,24 +269,67 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }
 
+            try
+            {
+                // Create the guard immediately after opening
+                _guard = new SerialPortGuard(
+                    _port,
+                    _logger,
+                    () => { lock (_pollingLock) { _commandInProgress = true; } },
+                    () => { lock (_pollingLock) { _commandInProgress = false; } }
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger?.Log($"Failed to create SerialPortGuard: {ex.Message}", LogLevel.Error);
+                _port.Close();
+                _guard = null;
+                _logger?.Log("Serial port closed due to guard creation failure.", LogLevel.Info);
+                return false;
+            }
+
             for (int attempt = 0; attempt < 2; attempt++)
             {
-                if (PingController())
+                if (_guard != null && PingController())
                 {
                     _logger?.Log("Connected ok", LogLevel.Info);
                     return true;
                 }
+
                 Thread.Sleep(100); // between attempts
+
                 if (attempt == 1)
                 {
                     _logger?.Log("Ping failed after 2 attempts.", LogLevel.Error);
-                    _port.Close();
-                    _guard?.Dispose();
-                    _guard = null;
-                    _logger?.Log("SerialPortGuard disposed after failed ping.", LogLevel.Debug);
+
+                    try
+                    {
+                        _port.Close();
+                        _logger?.Log("Serial port closed after failed ping.", LogLevel.Debug);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.Log($"Error closing serial port: {ex.Message}", LogLevel.Error);
+                    }
+
+                    if (_guard != null)
+                    {
+                        try
+                        {
+                            _guard.Dispose();
+                            _logger?.Log("SerialPortGuard disposed after failed ping.", LogLevel.Debug);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.Log($"Error disposing SerialPortGuard: {ex.Message}", LogLevel.Error);
+                        }
+                        _guard = null;
+                    }
+
                     _logger?.Log("Driver disconnected.", LogLevel.Info);
                 }
             }
+
             return false;
         }
 
@@ -989,25 +1022,42 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
-            // Wait briefly if a watchdog is already running
-            const int waitMs = 5000;
-            int waited = 0;
-            while (_config.WatchdogRunning && waited < waitMs)
+            // Wait for watchdog with timeout and cancellation
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(5000)))
             {
-                _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
-                await Task.Delay(500);
-                waited += 500;
+                try
+                {
+                    while (_config.WatchdogRunning)
+                    {
+                        _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
+                        await Task.Delay(500, cts.Token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger?.Log("Watchdog wait timed out — forcing stop.", LogLevel.Warning);
+                    CancelCurrentActionWatchdog();
+                    _config.WatchdogRunning = false;
+
+                    // Give it a moment to actually stop
+                    await Task.Delay(100);
+                }
             }
 
+            // Double-check it's actually stopped
             if (_config.WatchdogRunning)
             {
-                _logger?.Log("Existing watchdog still active — forcing stop.", LogLevel.Warning);
-                CancelCurrentActionWatchdog();
-                _config.WatchdogRunning = false;
+                _logger?.Log("Watchdog still running after forced stop — aborting reset.", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, "Reset aborted: watchdog failed to stop");
+                return;
             }
 
             bool softOnly = reset == "soft";
             bool hardOnly = reset == "hard";
+
+            StopPolling();
+            _config.ControllerReady = false;
+            _config.Resetting = true;
 
             StopPolling();
             _config.ControllerReady = false;
@@ -1573,52 +1623,74 @@ namespace Pulsar_DomeDriver.Driver
             if (_disposed) return;
             _disposed = true;
 
-            try
+            var failures = new List<string>();
+
+            void SafeDispose(Action action, string name)
             {
-                try { StopPolling(); } catch { }
-                try { StopWatchdog(); } catch { }
+                try { action(); }
+                catch (Exception ex) { failures.Add($"{name}: {ex.Message}"); }
+            }
 
-                try { DisconnectMqttSafely(); } catch { }
+            SafeDispose(() => StopPolling(), "StopPolling");
+            SafeDispose(() => StopWatchdog(), "StopWatchdog");
+            SafeDispose(() => DisconnectMqttSafely(), "DisconnectMqttSafely");
 
-                try
+            SafeDispose(() =>
+            {
+                if (_guard != null)
                 {
-                    if (_guard != null)
-                    {
-                        _guard.Dispose();
-                        _guard = null;
-                    }
+                    _guard.Dispose();
+                    _guard = null;
                 }
-                catch { }
+            }, "SerialPortGuard");
 
-                try
+            SafeDispose(() =>
+            {
+                if (_port != null)
                 {
-                    if (_port != null)
+                    if (_port.IsOpen)
                     {
-                        if (_port.IsOpen)
-                        {
-                            _port.Close();
-                        }
-                        _port.Dispose();
-                        _port = null;
+                        _port.Close();
                     }
+                    _port.Dispose();
+                    _port = null;
                 }
-                catch { }
+            }, "SerialPort");
 
+            SafeDispose(() =>
+            {
                 lock (_pollingLock)
                 {
                     _connected = false;
                 }
+            }, "PollingLock");
 
-                if (disposing)
-                {
-                    try { _systemWatchdogCts?.Dispose(); _systemWatchdogCts = null; } catch { }
-                    try { _pollingCancel?.Dispose(); _pollingCancel = null; } catch { }
-                    try { _logger?.Log("Driver disposed.", LogLevel.Info); } catch { }
-                    try { _logger?.Dispose(); } catch { }
-                }
-            }
-            catch
+            if (disposing)
             {
+                SafeDispose(() =>
+                {
+                    _systemWatchdogCts?.Dispose();
+                    _systemWatchdogCts = null;
+                }, "SystemWatchdogCts");
+
+                SafeDispose(() =>
+                {
+                    _pollingCancel?.Dispose();
+                    _pollingCancel = null;
+                }, "PollingCancel");
+
+                SafeDispose(() => _logger?.Log("Driver disposed.", LogLevel.Info), "Logger.Log");
+
+                SafeDispose(() => _logger?.Dispose(), "Logger.Dispose");
+            }
+
+            if (failures.Any())
+            {
+                try
+                {
+                    _logger?.Log($"Disposal warnings: {string.Join("; ", failures)}", LogLevel.Warning);
+                }
+                catch { /* Don't let logging failure block disposal */ }
             }
         }
 
@@ -1742,6 +1814,52 @@ namespace Pulsar_DomeDriver.Driver
         }
 
         #endregion
+
+    //    private void ExecuteCommand(
+    //DomeCommandIntent intent,
+    //string command,
+    //string action,
+    //string longAction,
+    //Func<bool> alreadyComplete,
+    //Func<ActionWatchdog.WatchdogResult> checkStatus,
+    //int timeoutMs)
+    //    {
+    //        _config.ForceBusy = true;
+    //        _lastIntent = intent;
+
+    //        LogDome($"{action}...");
+
+    //        bool pollingWasStopped = StopPolling();
+    //        if (pollingWasStopped)
+    //        {
+    //            _pollingTask?.Wait(Timeouts.PollingTaskWait);
+    //            Thread.Sleep(Timeouts.SerialBufferSettle);
+    //        }
+
+    //        try
+    //        {
+    //            if (alreadyComplete())
+    //            {
+    //                _logger?.Log($"Already complete — skipping {action}.", LogLevel.Info);
+    //                _config.ForceBusy = false;
+    //                StartPolling();
+    //                return;
+    //            }
+
+    //            if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
+    //            {
+    //                _logger?.Log($"{action} command failed: No match response.", LogLevel.Error);
+    //                RaiseAlarmAndReset($"{action} command failed (no ACK).");
+    //                return;
+    //            }
+
+    //            // ... rest of common logic
+    //        }
+    //        finally
+    //        {
+    //            StartPolling();
+    //        }
+    //    }
 
         #region Ascom Actions
 
@@ -2710,6 +2828,8 @@ namespace Pulsar_DomeDriver.Driver
         }
 
         // Start a new action watchdog with CTS handover and race-free cleanup
+
+
         private void StartActionWatchdog(
             TimeSpan timeout,
             string action,
@@ -2721,9 +2841,12 @@ namespace Pulsar_DomeDriver.Driver
         {
             var cts = new CancellationTokenSource();
 
-            // handover: ensure prior CTS is disposed after we create the new one
+            // Dispose previous CTS safely
             try { _actionWatchdogCts?.Dispose(); } catch { }
             _actionWatchdogCts = cts;
+
+            // Increment generation to track this watchdog instance
+            int generation = Interlocked.Increment(ref _watchdogGeneration);
 
             var watchdog = new ActionWatchdog(
                 config: _config,
@@ -2753,11 +2876,16 @@ namespace Pulsar_DomeDriver.Driver
                 }
                 finally
                 {
-                    if (ReferenceEquals(_actionWatchdog, watchdog)) _actionWatchdog = null;
-                    if (ReferenceEquals(_actionWatchdogCts, cts))
+                    // Only clear if this is the latest generation
+                    if (Interlocked.CompareExchange(ref _watchdogGeneration, generation, generation) == generation)
                     {
-                        try { _actionWatchdogCts?.Dispose(); } catch { }
-                        _actionWatchdogCts = null;
+                        _actionWatchdog = null;
+
+                        if (_actionWatchdogCts == cts)
+                        {
+                            try { _actionWatchdogCts?.Dispose(); } catch { }
+                            _actionWatchdogCts = null;
+                        }
                     }
                 }
             });

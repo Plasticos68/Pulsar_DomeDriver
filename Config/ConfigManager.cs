@@ -276,11 +276,48 @@ namespace Pulsar_DomeDriver.Config
             set => _profile.WriteValue(_driverId, "GNSDispatcherPath", value, "");
         }
 
-        public bool Rebooting { get; set; } = false;
+        // These are read/written by multiple threads without locking
+        private volatile bool _rebooting = false;
+        private volatile bool _resetting = false;
+        private volatile bool _forceBusy = false;
+        private volatile bool _controllerReady = false;
+        private volatile bool _watchdogRunning = false;
 
-        public bool Resetting { get; set; } = false;
+        public bool Rebooting
+        {
+            get => _rebooting;
+            set => _rebooting = value;
+        }
 
-        public bool ForceBusy { get; set; } = false;
+        public bool Resetting
+        {
+            get => _resetting;
+            set => _resetting = value;
+        }
+
+        public bool ForceBusy
+        {
+            get => _forceBusy;
+            set => _forceBusy = value;
+        }
+
+        public bool ControllerReady
+        {
+            get => _controllerReady;
+            set => _controllerReady = value;
+        }
+
+        public bool WatchdogRunning
+        {
+            get => _watchdogRunning;
+            set => _watchdogRunning = value;
+        }
+
+        //public bool Rebooting { get; set; } = false;
+
+        //public bool Resetting { get; set; } = false;
+
+        //public bool ForceBusy { get; set; } = false;
 
         public bool SoftResetAttempted { get; set; } = false;
 
@@ -296,17 +333,17 @@ namespace Pulsar_DomeDriver.Config
 
         public double JogSize { get; set; } = 10; // below this level it's a "jog" and not messaged to GNS
 
-        public bool WatchdogRunning { get; set; } = false;
+        //public bool WatchdogRunning { get; set; } = false;
 
-        //private volatile bool _watchdogRunning = false;
+        ////private volatile bool _watchdogRunning = false;
 
-        //public bool WatchdogRunning
-        //{
-        //    get => _watchdogRunning;
-        //    set => _watchdogRunning = value;
-        //}
+        ////public bool WatchdogRunning
+        ////{
+        ////    get => _watchdogRunning;
+        ////    set => _watchdogRunning = value;
+        ////}
 
-        public bool ControllerReady { get; set; } = false;
+        //public bool ControllerReady { get; set; } = false;
 
         public void RegistryEntries()
         {
