@@ -101,6 +101,10 @@ namespace Pulsar_DomeDriver.Helper
                 return raw;
 
             }
+            catch (ObjectDisposedException)
+            {
+                throw new ASCOM.NotConnectedException("Serial port was disposed.");
+            }
             finally
             {
                 _clearBusy?.Invoke();

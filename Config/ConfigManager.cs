@@ -298,6 +298,14 @@ namespace Pulsar_DomeDriver.Config
 
         public bool WatchdogRunning { get; set; } = false;
 
+        //private volatile bool _watchdogRunning = false;
+
+        //public bool WatchdogRunning
+        //{
+        //    get => _watchdogRunning;
+        //    set => _watchdogRunning = value;
+        //}
+
         public bool ControllerReady { get; set; } = false;
 
         public void RegistryEntries()

@@ -15,6 +15,7 @@ namespace Pulsar_DomeDriver.MQTT
         private IMqttClientOptions _options;
         private readonly FileLogger _logger;
         private readonly ConfigManager _config;
+        private bool _initialized = false; // Prevent multiple initializations
 
         public MqttPublisher(FileLogger logger, ConfigManager config)
         {
@@ -29,6 +30,12 @@ namespace Pulsar_DomeDriver.MQTT
         {
             _logger.Log("[MQTT] InitializeAsync entered", LogLevel.Trace);
 
+            if (_initialized)
+            {
+                _logger.Log("[MQTT] Initialization skipped — already initialized", LogLevel.Debug);
+                return;
+            }
+
             try
             {
                 var factory = new MqttFactory();
@@ -38,6 +45,10 @@ namespace Pulsar_DomeDriver.MQTT
                     .WithClientId("DomeDriver")
                     .WithTcpServer(brokerIp, port)
                     .Build();
+
+                // Clear any previously assigned handlers
+                _client.ConnectedHandler = null;
+                _client.DisconnectedHandler = null;
 
                 _client.UseConnectedHandler(e =>
                 {
@@ -52,15 +63,15 @@ namespace Pulsar_DomeDriver.MQTT
 
                 _logger.Log("[MQTT] Attempting ConnectAsync...", LogLevel.Debug);
                 await _client.ConnectAsync(_options);
-
                 _logger.Log("[MQTT] ConnectAsync completed", LogLevel.Info);
+
+                _initialized = true; // Mark as initialized
             }
             catch (Exception ex)
             {
                 _logger.Log($"[MQTT] Connection failed: {ex}", LogLevel.Error);
             }
         }
-
         public async Task PublishAsync(string topic, string payload)
         {
             if (_config.Rebooting)
@@ -124,6 +135,10 @@ namespace Pulsar_DomeDriver.MQTT
                 throw new InvalidOperationException("MQTT client is not connected.");
             }
 
+            // 🔧 Clear any previously registered message handler
+            _client.ApplicationMessageReceivedHandler = null;
+
+            // 🔧 Register new message handler
             _client.UseApplicationMessageReceivedHandler(e =>
             {
                 try
@@ -155,7 +170,6 @@ namespace Pulsar_DomeDriver.MQTT
                 _logger.Log($"[MQTT] Subscription error: {ex.Message}", LogLevel.Error);
             }
         }
-
         public async Task DisconnectAsync()
         {
             _logger.Log("[MQTT] DisconnectAsync entered", LogLevel.Trace);

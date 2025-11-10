@@ -173,68 +173,69 @@ namespace Pulsar_DomeDriver.Driver
                         _logger?.Log("Already connected. Skipping reinitialization.", LogLevel.Debug);
                         return;
                     }
-                }
 
-                if (value)
-                {
-                    bool success = ConnectController();
 
-                    if (success)
+                    if (value)
                     {
-                        lock (_pollingLock)
+                        bool success = ConnectController();
+
+                        if (success)
                         {
-                            _connected = true;
-                            //LogConnectionSnapshot();  // for debugging
+                            lock (_pollingLock)
+                            {
+                                _connected = true;
+                                //LogConnectionSnapshot();  // for debugging
+                            }
+                            if (_config.UseMQTT)
+                            {
+                                Task.Run(async () => await StartMQTTAsync());
+                                TryMQTTPublish(_mqttStatus, "Driver connected");
+                                StartWatchdog();
+                            }
+                            SetPollingInterval(_config._pollingIntervalMs);
+                            StartPolling();
+                            _GNS.SendGNS(GNSType.Message, "Dome driver connected");
                         }
-                        if (_config.UseMQTT)
+                        else
                         {
-                            Task.Run(async () => await StartMQTTAsync());
-                            TryMQTTPublish(_mqttStatus, "Driver connected");
-                            StartWatchdog();
+                            throw new ASCOM.NotConnectedException("Failed to connect to controller.");
                         }
-                        SetPollingInterval(_config._pollingIntervalMs);
-                        StartPolling();
-                        _GNS.SendGNS(GNSType.Message, "Dome driver connected");
                     }
                     else
                     {
-                        throw new ASCOM.NotConnectedException("Failed to connect to controller.");
-                    }
-                }
-                else
-                {
-                    bool pollingStopped = StopPolling();
-                    StopWatchdog();
-                    if (pollingStopped)
-                    {
-                        if (_pollingTask != null)
+                        bool pollingStopped = StopPolling();
+                        StopWatchdog();
+                        if (pollingStopped)
                         {
-                            _pollingTask.Wait();      // Waits for polling task to finish (synchronously)
-                            Thread.Sleep(50);         // Optional buffer to let serial port settle
+                            if (_pollingTask != null)
+                            {
+                                _pollingTask.Wait();      // Waits for polling task to finish (synchronously)
+                                Thread.Sleep(50);         // Optional buffer to let serial port settle
+                            }
+                            _logger?.Log("Polling task stopped successfully.", LogLevel.Debug);
                         }
-                        _logger?.Log("Polling task stopped successfully.", LogLevel.Debug);
+                        if (_mqttPublisher != null && _mqttPublisher.IsConnected)
+                        {
+                            Task.Run(async () => await _mqttPublisher.PublishAsync(_mqttStatus, "Driver disconnected"));
+                            Task.Run(async () => await _mqttPublisher.DisconnectAsync());
+                            _logger?.Log("MQTT disconnected", LogLevel.Info);
+                        }
+
+
+
+                        lock (_pollingLock)
+                        {
+                            _connected = false;
+                        }
+                        _logger?.Log("Disconnect initiated.", LogLevel.Info);
+                        var start = DateTime.UtcNow;
+
+                        DisconnectController();
+
+                        var elapsed = DateTime.UtcNow - start;
+                        _logger?.Log($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
+                        _GNS.SendGNS(GNSType.Message, "Dome driver disconnected");
                     }
-                    if (_mqttPublisher != null && _mqttPublisher.IsConnected)
-                    {
-                        Task.Run(async () => await _mqttPublisher.PublishAsync(_mqttStatus, "Driver disconnected"));
-                        Task.Run(async () => await _mqttPublisher.DisconnectAsync());
-                        _logger?.Log("MQTT disconnected", LogLevel.Info);
-                    }
-
-
-
-                    lock (_pollingLock)
-                    {
-                        _connected = false;
-                    }
-                    _logger?.Log("Disconnect initiated.", LogLevel.Info);
-                    var start = DateTime.UtcNow;
-
-                    DisconnectController();
-
-                    var elapsed = DateTime.UtcNow - start;
-                    _logger?.Log($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
-                    _GNS.SendGNS(GNSType.Message, "Dome driver disconnected");
                 }
             }
         }
