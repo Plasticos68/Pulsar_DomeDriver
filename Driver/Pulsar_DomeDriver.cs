@@ -1049,9 +1049,11 @@ namespace Pulsar_DomeDriver.Driver
             {
                 _logger?.Log("Watchdog wait timed out — forcing stop.", LogLevel.Warning);
                 CancelCurrentActionWatchdog();
+                _actionWatchdog?.Stop(); // redundant but explicit
+                _actionWatchdog = null;  // reinforces cleanup
                 _config.WatchdogRunning = false;
 
-                await Task.Delay(_config.watchDogSettle); // allow watchdog to settle
+                await Task.Delay(_config.watchDogSettle);
             }
             finally
             {
@@ -1469,12 +1471,13 @@ namespace Pulsar_DomeDriver.Driver
         // Null-safe, non-blocking MQTT publish
         private void TryMQTTPublish(string topic, string message)
         {
+            if (_config.Rebooting) return;
+
             if (_mqttPublisher != null && _mqttPublisher.IsConnected && !string.IsNullOrWhiteSpace(topic))
             {
                 _ = _mqttPublisher.PublishAsync(topic, message);
             }
         }
-
 
         #endregion
 
@@ -2075,7 +2078,7 @@ double? gnsTimeoutFactor = null)
             if (azimuth < 0 || azimuth >= 360)
                 throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
 
-            double changeAzimuth = Math.Abs(azimuth - _config.Azimuth);
+            changeAzimuth = Math.Abs(azimuth - _config.Azimuth);
             string message = $"Slewing to Azimuth {azimuth}...";
             string command = $"ABS {azimuth}";
             LogDome(message);

@@ -76,22 +76,29 @@ namespace Pulsar_DomeDriver.Helper
 
             try
             {
-                while (!_internalCts.IsCancellationRequested)
+                try
                 {
-                    if (_checkStatus() == WatchdogResult.Success)
+                    while (!_internalCts.IsCancellationRequested)
                     {
-                        _tcs.TrySetResult(WatchdogResult.Success);
-                        break;
-                    }
+                        if (_checkStatus() == WatchdogResult.Success)
+                        {
+                            _tcs.TrySetResult(WatchdogResult.Success);
+                            break;
+                        }
 
-                    if (_tcs.Task.IsCompleted) break;
-                    if (timeoutTask.IsCompleted)
-                    {
-                        _tcs.TrySetResult(WatchdogResult.Timeout);
-                        break;
-                    }
+                        if (_tcs.Task.IsCompleted) break;
+                        if (timeoutTask.IsCompleted)
+                        {
+                            _tcs.TrySetResult(WatchdogResult.Timeout);
+                            break;
+                        }
 
-                    await Task.Delay(_config.watchDogSettle * 2, _internalCts.Token);
+                        await Task.Delay(_config.watchDogSettle * 2, _internalCts.Token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _tcs.TrySetResult(WatchdogResult.Failure);
                 }
 
                 result = _tcs.Task.IsCompleted ? _tcs.Task.Result : WatchdogResult.Failure;

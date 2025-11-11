@@ -151,12 +151,15 @@ namespace Pulsar_DomeDriver.Helper
             }
         }
 
+        private readonly object _disposeLock = new();
+
         public void Dispose()
         {
             Volatile.Write(ref _isDisposing, true);
-            _port?.Close();
-            _port?.Dispose();
-            _gate?.Dispose();
+
+            try { _port?.Close(); } catch { }
+            try { _port?.Dispose(); } catch { }
+            try { _gate?.Dispose(); } catch { }
         }
 
         private void FlushIfStale(string context)
