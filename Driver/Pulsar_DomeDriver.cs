@@ -123,7 +123,7 @@ namespace Pulsar_DomeDriver.Driver
                 _config = new ConfigManager(_profile, _logger);
                 _GNS = new GNS(_logger, _config);
 
-                int _pollingIntervalMs = _config._pollingIntervalMs;
+                //int _pollingIntervalMs = _config.pollingIntervalMs;
 
                 // Proceed with driver setup
                 InitializeSerialPort();
@@ -171,32 +171,36 @@ namespace Pulsar_DomeDriver.Driver
                         return;
                     }
 
-
                     if (value)
                     {
                         bool success = ConnectController();
 
-                        if (success)
+                        if (!success)
+                            throw new ASCOM.NotConnectedException("Failed to connect to controller.");
+
+                        if (_config.UseMQTT)
                         {
-                            lock (_pollingLock)
+                            try
                             {
-                                _connected = true;
-                                //LogConnectionSnapshot();  // for debugging
-                            }
-                            if (_config.UseMQTT)
-                            {
-                                Task.Run(async () => await StartMQTTAsync());
+                                StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
                                 TryMQTTPublish(_mqttStatus, "Driver connected");
                                 StartWatchdog();
                             }
-                            SetPollingInterval(_config._pollingIntervalMs);
-                            StartPolling();
-                            _GNS.SendGNS(GNSType.Message, "Dome driver connected");
+                            catch (Exception ex)
+                            {
+                                _logger?.Log($"MQTT startup failed: {ex.Message}", LogLevel.Error);
+                                throw new ASCOM.NotConnectedException("MQTT startup failed.");
+                            }
                         }
-                        else
+
+                        lock (_pollingLock)
                         {
-                            throw new ASCOM.NotConnectedException("Failed to connect to controller.");
+                            _connected = true;
                         }
+
+                        SetPollingInterval(_config.pollingIntervalMs);
+                        StartPolling();
+                        _GNS.SendGNS(GNSType.Message, "Dome driver connected");
                     }
                     else
                     {
@@ -207,7 +211,7 @@ namespace Pulsar_DomeDriver.Driver
                             if (_pollingTask != null)
                             {
                                 _pollingTask.Wait();      // Waits for polling task to finish (synchronously)
-                                Thread.Sleep(50);         // Optional buffer to let serial port settle
+                                Thread.Sleep(_config.serialSettle);         // Optional buffer to let serial port settle
                             }
                             _logger?.Log("Polling task stopped successfully.", LogLevel.Debug);
                         }
@@ -420,7 +424,7 @@ namespace Pulsar_DomeDriver.Driver
                     _logger?.Log($"Polling interval {milliseconds} ms is out of bounds. Clamping to safe range.", LogLevel.Error);
                     milliseconds = Math.Max(50, Math.Min(milliseconds, 10000));
                 }
-                _config._pollingIntervalMs = milliseconds;
+                _config.pollingIntervalMs = milliseconds;
             }
         }
 
@@ -452,7 +456,7 @@ namespace Pulsar_DomeDriver.Driver
                     }
                 }
 
-                _logger?.Log($"Starting polling with interval {_config._pollingIntervalMs} ms.", LogLevel.Debug);
+                _logger?.Log($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
 
                 _pollingCancel?.Cancel();
                 _pollingCancel?.Dispose();
@@ -502,23 +506,34 @@ namespace Pulsar_DomeDriver.Driver
         private async Task PollLoopAsync(CancellationToken token)
         {
             int cycleCount = 0;
-
-            bool skipPolling;
             bool commandWasActive;
             bool rebootWasActive;
 
-            lock (_pollingLock)
+            int startupWaitMs = 0;
+            while (true)
             {
-                commandWasActive = _commandInProgress;
-                rebootWasActive = _config.Rebooting;
-                skipPolling = commandWasActive || rebootWasActive;
-            }
+                lock (_pollingLock)
+                {
+                    commandWasActive = _commandInProgress;
+                    rebootWasActive = _config.Rebooting;
+                }
 
-            if (skipPolling)
-            {
-                _logger?.Log($"Polling skipped: command={commandWasActive}, reboot={rebootWasActive}.", LogLevel.Debug);
-                _logger?.Log("Polling loop exited early due to active command or reboot.", LogLevel.Debug);
-                return;
+                if (!commandWasActive && !rebootWasActive)
+                    break;
+
+                if (startupWaitMs == 0)
+                {
+                    _logger?.Log($"Polling delayed: command={commandWasActive}, reboot={rebootWasActive}. Waiting for readiness...", LogLevel.Debug);
+                }
+
+                await Task.Delay(_config.pollingIntervalMs, token);
+                startupWaitMs += _config.pollingIntervalMs;
+
+                if (startupWaitMs >= _config.controllerTimeout)
+                {
+                    _logger?.Log("Polling startup timed out after 10s waiting for readiness. Exiting.", LogLevel.Warning);
+                    return;
+                }
             }
 
             _logger?.Log("Polling loop started.", LogLevel.Debug);
@@ -541,7 +556,7 @@ namespace Pulsar_DomeDriver.Driver
                     lock (_pollingLock)
                     {
                         shouldPoll = _pollingActive;
-                        interval = _config._pollingIntervalMs;
+                        interval = _config.pollingIntervalMs;
                     }
 
                     if (shouldPoll)
@@ -585,7 +600,7 @@ namespace Pulsar_DomeDriver.Driver
                             if (errorCount >= 3)
                             {
                                 _logger?.Log("Throttling polling due to repeated errors.", LogLevel.Debug);
-                                await Task.Delay(500, token); // brief pause
+                                await Task.Delay(_config.pollingIntervalMs, token); // brief pause
                             }
                         }
                     }
@@ -1018,29 +1033,31 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
-            // Wait for watchdog with timeout and cancellation
-            using (var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(5000)))
-            {
-                try
-                {
-                    while (_config.WatchdogRunning)
-                    {
-                        _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
-                        await Task.Delay(500, cts.Token);
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger?.Log("Watchdog wait timed out — forcing stop.", LogLevel.Warning);
-                    CancelCurrentActionWatchdog();
-                    _config.WatchdogRunning = false;
+            CancellationTokenSource? cts = null;
 
-                    // Give it a moment to actually stop
-                    await Task.Delay(100);
+            try
+            {
+                cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(5000));
+
+                while (_config.WatchdogRunning)
+                {
+                    _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
+                    await Task.Delay(500, cts.Token);
                 }
             }
+            catch (OperationCanceledException)
+            {
+                _logger?.Log("Watchdog wait timed out — forcing stop.", LogLevel.Warning);
+                CancelCurrentActionWatchdog();
+                _config.WatchdogRunning = false;
 
-            // Double-check it's actually stopped
+                await Task.Delay(_config.watchDogSettle); // allow watchdog to settle
+            }
+            finally
+            {
+                cts?.Dispose();
+            }
+
             if (_config.WatchdogRunning)
             {
                 _logger?.Log("Watchdog still running after forced stop — aborting reset.", LogLevel.Error);
@@ -1050,10 +1067,6 @@ namespace Pulsar_DomeDriver.Driver
 
             bool softOnly = reset == "soft";
             bool hardOnly = reset == "hard";
-
-            StopPolling();
-            _config.ControllerReady = false;
-            _config.Resetting = true;
 
             StopPolling();
             _config.ControllerReady = false;
@@ -1087,6 +1100,7 @@ namespace Pulsar_DomeDriver.Driver
                             string message = "Soft reset completed successfully.";
                             _logger?.Log(message, LogLevel.Info);
                             _GNS.SendGNS(GNSType.Message, message);
+
                             lock (_pollingLock)
                             {
                                 _config.SlewingStatus = false;
@@ -1094,8 +1108,8 @@ namespace Pulsar_DomeDriver.Driver
                             }
 
                             StartPolling();
-                            Thread.Sleep(60);         // allow serial buffer to settle
-                            await Task.Delay(2000);   // allow controller to stabilise
+                            Thread.Sleep(_config.serialSettle); // settle time for serial
+                            await Task.Delay(_config.serialSettle * 4);
 
                             _ = Task.Run(ReplayLastCommand);
                             return;
@@ -1126,7 +1140,7 @@ namespace Pulsar_DomeDriver.Driver
                             _GNS.SendGNS(GNSType.Message, message);
 
                             StartPolling();
-                            Thread.Sleep(60);         // allow serial buffer to settle
+                            Thread.Sleep(60);
                             _ = Task.Run(ReplayLastCommand);
                             return;
                         }
@@ -1210,7 +1224,7 @@ namespace Pulsar_DomeDriver.Driver
             SendAndVerify("RESTART", ResponseMode.Blind);
             _logger?.Log("RESTART command sent (blind). Checking for reboot via shutter status...", LogLevel.Info);
 
-            await Task.Delay(1000);
+            await Task.Delay(_config.pollingIntervalMs * 2);
             DomeStatus();
             int initialStatus = _config.ShutterStatus;
 
@@ -1292,8 +1306,8 @@ namespace Pulsar_DomeDriver.Driver
 
                 if (status >= 0 && status <= 3)
                 {
-                    _logger?.Log($"Shutter ready (status={status}). Waiting 5s before continuing...", LogLevel.Info);
-                    await Task.Delay(5000);
+                    _logger?.Log($"Shutter ready (status={status}). Waiting {_config.shutterSettle / 1000}s before continuing...", LogLevel.Info);
+                    await Task.Delay(_config.shutterSettle);
                     return true;
                 }
 
@@ -1811,78 +1825,40 @@ namespace Pulsar_DomeDriver.Driver
 
         #endregion
 
-        #region Ascom Actions
+        #region Ascom Action helpers
 
         private void ExecuteDomeCommand(
-    string command,
-    string message,
-    int timeoutMs,
-    DomeCommandIntent intent,
-    Func<bool> alreadyAtTarget,
-    Action updateConfigBeforeWatchdog,
-    Func<ActionWatchdog.WatchdogResult> checkStatus,
-    string mqttTopic,
-    string mqttSuccess,
-    string mqttFail,
-    string actionLabel,
-    string longAction,
-    string? gnsOverride = null,
-    double? gnsTimeoutFactor = null)
+string command,
+string message,
+int timeoutMs,
+DomeCommandIntent intent,
+Func<bool> alreadyAtTarget,
+Action updateConfigBeforeWatchdog,
+Func<ActionWatchdog.WatchdogResult> checkStatus,
+string mqttTopic,
+string mqttSuccess,
+string mqttFail,
+string actionLabel,
+string longAction,
+string? gnsOverride = null,
+double? gnsTimeoutFactor = null)
         {
-            _config.ForceBusy = true;
-            _lastIntent = intent;
-
-            if (gnsOverride != null || gnsTimeoutFactor != null)
-            {
-                int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * (gnsTimeoutFactor ?? 3.5));
-                _GNS.SendGNS(GNSType.New, gnsOverride ?? message, gnsTimeout);
-            }
-
-            bool pollingWasStopped = StopPolling();
-
-            if (pollingWasStopped)
-            {
-                _pollingTask?.Wait(1000);
-                Thread.Sleep(60);
-            }
+            PrepareCommandExecution(message, gnsOverride, gnsTimeoutFactor, timeoutMs, intent);
 
             try
             {
-                if (alreadyAtTarget())
-                {
-                    _logger?.Log("Already at target — skipping command and watchdog.", LogLevel.Info);
-                    _config.ForceBusy = false;
-                    StartPolling();
+                if (!TrySendCommand(command, intent, alreadyAtTarget, actionLabel))
                     return;
-                }
-
-                if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
-                {
-                    _logger?.Log($"{actionLabel} command failed: No match response.", LogLevel.Error);
-                    RaiseAlarmAndReset($"{actionLabel} command failed (no ACK).");
-                    return;
-                }
 
                 lock (_pollingLock)
                 {
                     updateConfigBeforeWatchdog();
                 }
 
-                int waitMs = 0;
-                while (!_config.ControllerReady && waitMs < 10000)
-                {
-                    Thread.Sleep(500);
-                    waitMs += 500;
-                }
-
-                if (!_config.ControllerReady)
-                {
-                    _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
-                    RaiseAlarmAndReset($"Controller not ready after {actionLabel}; initiating recovery.");
+                if (!WaitForControllerReady(actionLabel))
                     return;
-                }
 
-                StartActionWatchdog(
+                LaunchActionWatchdog(
                     timeout: TimeSpan.FromMilliseconds(timeoutMs),
                     action: actionLabel,
                     longAction: longAction,
@@ -1902,7 +1878,66 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
-        private void StartActionWatchdog(
+
+        private void PrepareCommandExecution(string message, string? gnsOverride, double? gnsTimeoutFactor, int timeoutMs, DomeCommandIntent intent)
+        {
+            _config.ForceBusy = true;
+            _lastIntent = intent;
+
+            if (gnsOverride != null || gnsTimeoutFactor != null)
+            {
+                int gnsTimeout = (int)Math.Round(timeoutMs / 1000 * (gnsTimeoutFactor ?? 3.5));
+                _GNS.SendGNS(GNSType.New, gnsOverride ?? message, gnsTimeout);
+            }
+
+            bool pollingWasStopped = StopPolling();
+            if (pollingWasStopped)
+            {
+                _pollingTask?.Wait(_config.pollingIntervalMs * 2);
+                Thread.Sleep(60);
+            }
+        }
+
+        private bool TrySendCommand(string command, DomeCommandIntent intent, Func<bool> alreadyAtTarget, string actionLabel)
+        {
+            if (alreadyAtTarget())
+            {
+                _logger?.Log("Already at target — skipping command and watchdog.", LogLevel.Info);
+                _config.ForceBusy = false;
+                StartPolling();
+                return false;
+            }
+
+            if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
+            {
+                _logger?.Log($"{actionLabel} command failed: No match response.", LogLevel.Error);
+                RaiseAlarmAndReset($"{actionLabel} command failed (no ACK).");
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool WaitForControllerReady(string actionLabel)
+        {
+            int waitMs = 0;
+            while (!_config.ControllerReady && waitMs < _config.controllerTimeout)
+            {
+                Thread.Sleep(_config.pollingIntervalMs);
+                waitMs += _config.pollingIntervalMs;
+            }
+
+            if (!_config.ControllerReady)
+            {
+                _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
+                RaiseAlarmAndReset($"Controller not ready after {actionLabel}; initiating recovery.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private void LaunchActionWatchdog(
     TimeSpan timeout,
     string action,
     string longAction,
@@ -1913,11 +1948,9 @@ namespace Pulsar_DomeDriver.Driver
         {
             var cts = new CancellationTokenSource();
 
-            // Dispose previous CTS safely
             try { _actionWatchdogCts?.Dispose(); } catch { }
             _actionWatchdogCts = cts;
 
-            // Increment generation to track this watchdog instance
             int generation = Interlocked.Increment(ref _watchdogGeneration);
 
             var watchdog = new ActionWatchdog(
@@ -1948,11 +1981,9 @@ namespace Pulsar_DomeDriver.Driver
                 }
                 finally
                 {
-                    // Only clear if this is the latest generation
-                    if (Interlocked.CompareExchange(ref _watchdogGeneration, generation, generation) == generation)
+                    if (_watchdogGeneration == generation)
                     {
                         _actionWatchdog = null;
-
                         if (_actionWatchdogCts == cts)
                         {
                             try { _actionWatchdogCts?.Dispose(); } catch { }
@@ -1972,6 +2003,10 @@ namespace Pulsar_DomeDriver.Driver
             _config.ForceBusy = true;
             _ = Task.Run(async () => await ResetRoutineAsync());
         }
+
+        #endregion
+
+        #region Ascom Actions
 
         public void OpenShutter()
         {

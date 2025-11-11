@@ -91,7 +91,7 @@ namespace Pulsar_DomeDriver.Helper
                         break;
                     }
 
-                    await Task.Delay(250, _internalCts.Token);
+                    await Task.Delay(_config.watchDogSettle * 2, _internalCts.Token);
                 }
 
                 result = _tcs.Task.IsCompleted ? _tcs.Task.Result : WatchdogResult.Failure;

@@ -1,6 +1,8 @@
 ﻿using ASCOM.Utilities;
 using Pulsar_DomeDriver.Diagnostics;
 using System.Collections.Generic;
+using System.Data;
+using System.Threading;
 
 namespace Pulsar_DomeDriver.Config
 {
@@ -50,7 +52,11 @@ namespace Pulsar_DomeDriver.Config
         public readonly int _connectRetryDelay = 2000; // milliseconds
         public string serialPort = "";
         //public readonly string _mqttAlarm = "Dome/alarm";
-        public int _pollingIntervalMs = 500;
+        public int pollingIntervalMs = 500;
+        public readonly int watchDogSettle = 100;
+        public readonly int shutterSettle = 5000;
+        public readonly int serialSettle = 60;
+        public readonly int controllerTimeout = 10000;
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;
@@ -277,47 +283,44 @@ namespace Pulsar_DomeDriver.Config
         }
 
         // These are read/written by multiple threads without locking
-        private volatile bool _rebooting = false;
-        private volatile bool _resetting = false;
-        private volatile bool _forceBusy = false;
-        private volatile bool _controllerReady = false;
-        private volatile bool _watchdogRunning = false;
+
+        // Backing fields as integers for atomic operations
+        private int _rebootingInt = 0;
+        private int _resettingInt = 0;
+        private int _forceBusyInt = 0;
+        private int _controllerReadyInt = 0;
+        private int _watchdogRunningInt = 0;
 
         public bool Rebooting
         {
-            get => _rebooting;
-            set => _rebooting = value;
+            get => Interlocked.CompareExchange(ref _rebootingInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _rebootingInt, value ? 1 : 0);
         }
 
         public bool Resetting
         {
-            get => _resetting;
-            set => _resetting = value;
+            get => Interlocked.CompareExchange(ref _resettingInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _resettingInt, value ? 1 : 0);
         }
 
         public bool ForceBusy
         {
-            get => _forceBusy;
-            set => _forceBusy = value;
+            get => Interlocked.CompareExchange(ref _forceBusyInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _forceBusyInt, value ? 1 : 0);
         }
 
         public bool ControllerReady
         {
-            get => _controllerReady;
-            set => _controllerReady = value;
+            get => Interlocked.CompareExchange(ref _controllerReadyInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _controllerReadyInt, value ? 1 : 0);
         }
 
         public bool WatchdogRunning
         {
-            get => _watchdogRunning;
-            set => _watchdogRunning = value;
+            get => Interlocked.CompareExchange(ref _watchdogRunningInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _watchdogRunningInt, value ? 1 : 0);
         }
 
-        //public bool Rebooting { get; set; } = false;
-
-        //public bool Resetting { get; set; } = false;
-
-        //public bool ForceBusy { get; set; } = false;
 
         public bool SoftResetAttempted { get; set; } = false;
 
@@ -332,18 +335,6 @@ namespace Pulsar_DomeDriver.Config
         public double SlewAz { get; set; }
 
         public double JogSize { get; set; } = 10; // below this level it's a "jog" and not messaged to GNS
-
-        //public bool WatchdogRunning { get; set; } = false;
-
-        ////private volatile bool _watchdogRunning = false;
-
-        ////public bool WatchdogRunning
-        ////{
-        ////    get => _watchdogRunning;
-        ////    set => _watchdogRunning = value;
-        ////}
-
-        //public bool ControllerReady { get; set; } = false;
 
         public void RegistryEntries()
         {

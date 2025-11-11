@@ -48,13 +48,18 @@ namespace Pulsar_DomeDriver.Helper
                 if (!IsReady)
                     throw new ASCOM.NotConnectedException("Serial port is not open.");
 
-                Thread.Sleep(60); // settle previous activity
+                // Optional: settle time before checking buffer
+                Thread.Sleep(60);
 
+                // Check for unexpected leftover data
                 if (_port.BytesToRead > 0)
                 {
-                    _logger?.Log("Warning: serial buffer not empty before read. Flushing.", LogLevel.Debug);
-                    _port.DiscardInBuffer();
-                    Thread.Sleep(60);
+                    string leftover = _port.ReadExisting();
+                    if (!string.IsNullOrWhiteSpace(leftover))
+                    {
+                        _logger?.Log($"Warning: unexpected data in serial buffer before sending '{command}': {leftover}", LogLevel.Warning);
+                    }
+                    Thread.Sleep(60); // allow buffer to settle
                 }
 
                 _port.DiscardOutBuffer();
@@ -153,5 +158,19 @@ namespace Pulsar_DomeDriver.Helper
             _port?.Dispose();
             _gate?.Dispose();
         }
+
+        private void FlushIfStale(string context)
+        {
+            if (_port.BytesToRead > 0)
+            {
+                string leftover = _port.ReadExisting();
+                if (!string.IsNullOrWhiteSpace(leftover))
+                {
+                    _logger?.Log($"[{context}] Unexpected data in buffer: {leftover}", LogLevel.Warning);
+                }
+            }
+        }
+
+
     }
 }
