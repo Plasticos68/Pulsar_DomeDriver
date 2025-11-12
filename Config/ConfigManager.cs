@@ -53,13 +53,14 @@ namespace Pulsar_DomeDriver.Config
         public readonly int _connectRetryDelay = 2000; // milliseconds
         public string serialPort = "";
         //public readonly string _mqttAlarm = "Dome/alarm";
-        public int pollingIntervalMs = 500;
+        public int pollingIntervalMs = 2000;
         public readonly int watchDogSettle = 100;
         public readonly int shutterSettle = 5000;
         public readonly int serialSettle = 60;
         public readonly int controllerTimeout = 10000;
         public readonly int statusMaxRetries = 2;       // number of retries for the domestatus before alarm
         public readonly int sendVerifyMaxRetries = 2;       // number of retries for the send and verify routine
+        public readonly int  pollingLoopRetries = 5;
 
 
         public double HomeAzimuth { get; private set; }

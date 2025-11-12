@@ -67,6 +67,7 @@ namespace Pulsar_DomeDriver.Helper
         public async Task Start()
         {
             _config.WatchdogRunning = true;
+            await AnnounceStartAsync();
             await PublishAsync(_mqttTopic, $"{_longAction}");
 
             //WatchdogLogger.Log($"[{_action}] Watchdog loop entered");

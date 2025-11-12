@@ -182,8 +182,9 @@ namespace Pulsar_DomeDriver.Driver
                         {
                             try
                             {
-                                StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
-                                TryMQTTPublish(_mqttStatus, "Driver connected");
+                                //StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
+                                Task.Run(async () => await StartMQTTAsync()).Wait();
+                                //TryMQTTPublish(_mqttStatus, "Driver connected");
                                 StartWatchdog();
                             }
                             catch (Exception ex)
@@ -444,6 +445,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public void StartPolling()
         {
+            _logger?.Log("StartPolling() invoked — launching polling loop", LogLevel.Info);
             lock (_pollingLock)
             {
                 if (_commandInProgress)
@@ -491,55 +493,6 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
-        public void oldStartPolling()
-        {
-            lock (_pollingLock)
-            {
-                if (_commandInProgress)
-                {
-                    _logger?.Log("Polling start blocked: command in progress.", LogLevel.Debug);
-                    return;
-                }
-
-                if (_pollingTask != null)
-                {
-                    _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Trace);
-
-                    if (!_pollingTask.IsCompleted && !_pollingTask.IsFaulted && !_pollingTask.IsCanceled)
-                    {
-                        _logger?.Log("Polling already active. Skipping restart.", LogLevel.Debug);
-                        return;
-                    }
-
-                    if (_pollingTask.Status != TaskStatus.Running &&
-                        _pollingTask.Status != TaskStatus.WaitingForActivation)
-                    {
-                        _logger?.Log($"Polling task is stale (status: {_pollingTask.Status}). Resetting.", LogLevel.Debug);
-                        _pollingTask = null;
-                    }
-                }
-
-                _logger?.Log($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
-
-                _pollingCancel?.Cancel();
-                _pollingCancel?.Dispose();
-                _pollingCancel = new CancellationTokenSource();
-
-                _lastPollTimestamp = DateTime.UtcNow;
-
-                try
-                {
-                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token));
-                    _pollingActive = true;
-                    //LogPollingStartupSnapshot();
-                }
-                catch (Exception ex)
-                {
-                    _logger?.Log($"Failed to start polling task: {ex.Message}", LogLevel.Error);
-                }
-            }
-        }
-
         public bool StopPolling()
         {
             lock (_pollingLock)
@@ -568,6 +521,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task PollLoopAsync(CancellationToken token)
         {
+            _logger?.Log("Polling loop heartbeat", LogLevel.Trace);
             int cycleCount = 0;
             bool commandWasActive;
             bool rebootWasActive;
@@ -580,6 +534,7 @@ namespace Pulsar_DomeDriver.Driver
                     commandWasActive = _commandInProgress;
                     rebootWasActive = _config.Rebooting;
                 }
+
                 _logger?.Log($"[PollLoop] commandWasActive={commandWasActive}, rebootWasActive={rebootWasActive}, elapsed={startupWaitMs} ms", LogLevel.Trace);
 
                 if (!commandWasActive && !rebootWasActive)
@@ -612,8 +567,8 @@ namespace Pulsar_DomeDriver.Driver
                         _logger?.Log("Polling cancellation requested.", LogLevel.Debug);
                         break;
                     }
+
                     cycleCount++;
-                    //LogPollingCycleSnapshot(cycleCount);
                     bool shouldPoll;
                     int interval;
 
@@ -627,27 +582,18 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         try
                         {
-                            _lastPollTimestamp = DateTime.UtcNow; // Update timestamp for watchdog
-                            SystemStatus(); // Called outside lock — safe
-                            errorCount = 0; // Reset on success
+                            _lastPollTimestamp = DateTime.UtcNow;
+                            SystemStatus(); // Safe outside lock
+                            errorCount = 0;
 
-                            // Deterministic watchdog success recognition
                             if (_lastIntent == DomeCommandIntent.GoHome && _config.HomeStatus)
-                            {
                                 _actionWatchdog?.MarkSuccess();
-                            }
                             if (_lastIntent == DomeCommandIntent.Park && _config.ParkStatus)
-                            {
                                 _actionWatchdog?.MarkSuccess();
-                            }
                             if (_lastIntent == DomeCommandIntent.OpenShutter && _config.ShutterStatus == 0)
-                            {
                                 _actionWatchdog?.MarkSuccess();
-                            }
                             if (_lastIntent == DomeCommandIntent.CloseShutter && _config.ShutterStatus == 1)
-                            {
                                 _actionWatchdog?.MarkSuccess();
-                            }
                             else if (_lastIntent == DomeCommandIntent.SlewAzimuth && _config.DomeState == 0)
                             {
                                 _actionWatchdog?.MarkSuccess();
@@ -661,17 +607,24 @@ namespace Pulsar_DomeDriver.Driver
                             errorCount++;
                             _logger?.Log($"Polling error #{errorCount}: {ex.Message}", LogLevel.Debug);
 
+                            if (errorCount >= _config.pollingLoopRetries)
+                            {
+                                _logger?.Log($"Polling error threshold reached ({_config.pollingLoopRetries}). Invoking PollingLoopFailure().", LogLevel.Warning);
+                                HandleDriverFailure(ex, errorCount);
+                                break;
+                            }
+
                             if (errorCount >= 3)
                             {
                                 _logger?.Log("Throttling polling due to repeated errors.", LogLevel.Debug);
-                                await Task.Delay(_config.pollingIntervalMs, token); // brief pause
+                                await Task.Delay(interval, token);
                             }
                         }
                     }
 
                     try
                     {
-                        await Task.Delay(interval, token); // non-blocking wait
+                        await Task.Delay(interval, token);
                     }
                     catch (TaskCanceledException)
                     {
@@ -680,8 +633,8 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     catch (Exception ex)
                     {
+                        HandleDriverFailure(ex);
                         _logger?.Log($"Polling delay error: {ex.Message}", LogLevel.Debug);
-                        // Continue polling despite delay error
                     }
                 }
             }
@@ -693,6 +646,19 @@ namespace Pulsar_DomeDriver.Driver
             {
                 _logger?.Log($"Polling thread exited cleanly. Last cancellation state: {token.IsCancellationRequested}", LogLevel.Debug);
             }
+        }
+
+        private void HandleDriverFailure(Exception lastException, int errorCount = 0, string reason = "Unknown")
+        {
+            _logger?.Log($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
+
+            _mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
+            _actionWatchdog?.MarkFailure();
+
+            _pollingActive = false;
+            Connected = false;
+
+            //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
         }
 
         private void StartWatchdog()
@@ -829,8 +795,8 @@ namespace Pulsar_DomeDriver.Driver
                 switch (_config.DomeState)
                 {
                     case 0: domeCurrent = "Idle"; break;
-                    case 1: domeCurrent = "Slewing to target"; break;
-                    case 9: domeCurrent = "Slewing to home"; break;
+                    case 1: domeCurrent = "Slewing"; break;
+                    case 9: domeCurrent = "Finding home"; break;
                     default: domeCurrent = "Unknown state"; break;
                 }
 
@@ -850,6 +816,13 @@ namespace Pulsar_DomeDriver.Driver
                 }
 
                 LogDomeStatus(domeCurrent, shutterCurrent);
+
+                // MQTT section
+                if (_mqttPublisher?.IsConnected == true && _config.UseMQTT)
+                {
+                    TryMQTTPublish(_mqttDomeStatus, domeCurrent);
+                    TryMQTTPublish(_mqttShutterStatus, shutterCurrent);
+                }
 
                 domeOutputStatus =
                     $"{_config.DomeState}," +
@@ -1580,7 +1553,7 @@ namespace Pulsar_DomeDriver.Driver
 
                 // Connect to broker
                 _logger?.Log("Initializing MQTT connection...", LogLevel.Debug);
-                await _mqttPublisher.InitializeAsync("localhost");
+                await _mqttPublisher.InitializeAsync("10.17.1.92");
                 _logger?.Log("MQTT connection established", LogLevel.Info);
 
                 // Publish startup message
@@ -2168,9 +2141,9 @@ double? gnsTimeoutFactor = null)
                     _ => ActionWatchdog.WatchdogResult.InProgress
                 },
                 mqttTopic: _mqttShutterStatus,
-                mqttSuccess: "Shutter is closed.",
+                mqttSuccess: "Shutter closed.",
                 mqttFail: "Shutter failed to close.",
-                actionLabel: "close shutter",
+                actionLabel: "Close shutter",
                 longAction: "Shutter closing..."
             );
         }
@@ -2181,7 +2154,7 @@ double? gnsTimeoutFactor = null)
                 throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
 
             changeAzimuth = Math.Abs(azimuth - _config.Azimuth);
-            string message = $"Slewing to Azimuth {azimuth}...";
+            string message = $"Slewing to {azimuth}...";
             string command = $"ABS {azimuth}";
             LogDome(message);
 
@@ -2207,10 +2180,10 @@ double? gnsTimeoutFactor = null)
                     return ActionWatchdog.WatchdogResult.Failure;
                 },
                 mqttTopic: _mqttDomeStatus,
-                mqttSuccess: $"Dome reached azimuth {azimuth}.",
+                mqttSuccess: $"Dome azimuth {azimuth}.",
                 mqttFail: $"Dome failed to reach azimuth {azimuth}.",
                 actionLabel: "goto azimuth",
-                longAction: $"Slewing to azimuth {azimuth}...",
+                longAction: $"Slewing to {azimuth}...",
                 gnsOverride: changeAzimuth > _config.JogSize ? message : null,
                 gnsTimeoutFactor: changeAzimuth > _config.JogSize ? 2.5 : null
             );
@@ -2240,7 +2213,7 @@ double? gnsTimeoutFactor = null)
                         : ActionWatchdog.WatchdogResult.InProgress;
                 },
                 mqttTopic: _mqttDomeStatus,
-                mqttSuccess: "Dome is at home.",
+                mqttSuccess: "Dome homed.",
                 mqttFail: "Dome failed to find home.",
                 actionLabel: "home",
                 longAction: "Finding home...",
@@ -2273,7 +2246,7 @@ double? gnsTimeoutFactor = null)
                         : ActionWatchdog.WatchdogResult.InProgress;
                 },
                 mqttTopic: _mqttDomeStatus,
-                mqttSuccess: "Dome is parked.",
+                mqttSuccess: "Dome parked.",
                 mqttFail: "Dome failed to park.",
                 actionLabel: "Park",
                 longAction: "Parking...",
