@@ -37,7 +37,7 @@ namespace Pulsar_DomeDriver.Driver
 
         // connection
         private bool _connected = false;
-        private readonly string _pingResponse = "Y519";
+        private readonly string _pingResponse = "Y159";
         private readonly string _generalResponse = "A";
 
         //polling thread for serial comms
@@ -79,7 +79,7 @@ namespace Pulsar_DomeDriver.Driver
         string _mqttDomeStatus = "Dome/Dome/Status";
         string _mqttShutterStatus = "Dome/Shutter/Status";
         string _mqttAlarm = "Dome/Alarm";
-        string _mqttWatchdog = "Dome/Watchdog";        
+        string _mqttWatchdog = "Dome/Watchdog";
 
         // GNS
         private GNS _GNS;
@@ -275,8 +275,22 @@ namespace Pulsar_DomeDriver.Driver
                 _guard = new SerialPortGuard(
                     _port,
                     _logger,
-                    () => { lock (_pollingLock) { _commandInProgress = true; } },
-                    () => { lock (_pollingLock) { _commandInProgress = false; } }
+                    () =>
+                    {
+                        lock (_pollingLock)
+                        {
+                            _commandInProgress = true;
+                            _logger?.Log($"[Guard] _commandInProgress = true at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+                        }
+                    },
+                    () =>
+                    {
+                        lock (_pollingLock)
+                        {
+                            _commandInProgress = false;
+                            _logger?.Log($"[Guard] _commandInProgress = false at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+                        }
+                    }
                 );
             }
             catch (Exception ex)
@@ -517,6 +531,7 @@ namespace Pulsar_DomeDriver.Driver
                     commandWasActive = _commandInProgress;
                     rebootWasActive = _config.Rebooting;
                 }
+                _logger?.Log($"[PollLoop] commandWasActive={commandWasActive}, rebootWasActive={rebootWasActive}, elapsed={startupWaitMs} ms", LogLevel.Trace);
 
                 if (!commandWasActive && !rebootWasActive)
                     break;
@@ -564,7 +579,7 @@ namespace Pulsar_DomeDriver.Driver
                         try
                         {
                             _lastPollTimestamp = DateTime.UtcNow; // Update timestamp for watchdog
-                            DomeStatus(); // Called outside lock — safe
+                            SystemStatus(); // Called outside lock — safe
                             errorCount = 0; // Reset on success
 
                             // Deterministic watchdog success recognition
@@ -712,104 +727,111 @@ namespace Pulsar_DomeDriver.Driver
 
         #region Pulsar Dome specific methods
 
-        public void DomeStatus()
+        public void SystemStatus()
         {
-            try
+            int attempt = 0;
+            bool allOk = false;
+
+            while (attempt <= _config.statusMaxRetries && !allOk)
             {
                 bool domeOk = ParseDomeStatus();
                 bool homeOk = ParseHomeStatus();
                 bool parkOk = ParseParkStatus();
+                SlewingStatus();
 
-                bool allOk = domeOk && homeOk && parkOk;
+                allOk = domeOk && homeOk && parkOk;
 
-                if (allOk)
+                if (!allOk)
                 {
-                    if (!_config.ControllerReady)
-                    {
-                        _config.ControllerReady = true;
-                        _logger?.Log("ControllerReady set to true — poller confirmed valid status.", LogLevel.Debug);
-                    }
-
-                    // Slewing status
-                    if (_config.ForceBusy)
-                    {
-                        _config.SlewingStatus = true;
-                    }
-                    else
-                    {
-                        bool isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
-                        _config.SlewingStatus = !isStationary;
-                    }
-
-                    // Dome status description
-                    switch (_config.DomeState)
-                    {
-                        case 0: domeCurrent = "Idle"; break;
-                        case 1: domeCurrent = "Slewing to target"; break;
-                        case 9: domeCurrent = "Slewing to home"; break;
-                        default: domeCurrent = "Unknown state"; break;
-                    }
-
-                    if (_config.HomeStatus) domeCurrent = "Home";
-                    if (_config.ParkStatus) domeCurrent = "Parked";
-
-                    // Shutter status description
-                    switch (_config.ShutterStatus)
-                    {
-                        case 0: shutterCurrent = "Open"; break;
-                        case 1: shutterCurrent = "Closed"; break;
-                        case 2: shutterCurrent = "Opening"; break;
-                        case 3: shutterCurrent = "Closing"; break;
-                        case 4: shutterCurrent = "Error"; break;
-                        case 5: shutterCurrent = "Unknown"; break;
-                        default: shutterCurrent = "Invalid status"; break;
-                    }
-
-                    LogDomeStatus(domeCurrent, shutterCurrent);
-
-                    domeOutputStatus =
-                        $"{_config.DomeState}," +
-                        $"{(_config.HomeStatus ? 1 : 0)}," +
-                        $"{(_config.ParkStatus ? 1 : 0)}," +
-                        $"{_config.Azimuth}," +
-                        $"{_config.TargetAzimuth}," +
-                        $"{(_config.SlewingStatus ? 1 : 0)}," +
-                        $"{_config.ShutterStatus}";
-
-                    // Unified completion check
-                    if (IsCommandComplete())
-                    {
-                        _actionWatchdog?.MarkSuccess();
-                        var completedIntent = _lastIntent;
-                        _lastIntent = DomeCommandIntent.None;
-
-                        // GNS message
-                        switch (completedIntent)
-                        {
-                            case DomeCommandIntent.GoHome:
-                                _GNS.SendGNS(GNSType.Stop, "Dome homed successfully");
-                                break;
-                            case DomeCommandIntent.Park:
-                                _GNS.SendGNS(GNSType.Stop, "Dome parked successfully");
-                                break;
-                            case DomeCommandIntent.OpenShutter:
-                                _GNS.SendGNS(GNSType.Stop, "Shutter opened successfully");
-                                break;
-                            case DomeCommandIntent.CloseShutter:
-                                _GNS.SendGNS(GNSType.Stop, "Shutter closed successfully");
-                                break;
-                            case DomeCommandIntent.SlewAzimuth:
-                                if (changeAzimuth >= _config.JogSize)
-                                    _GNS.SendGNS(GNSType.Stop, "Dome slew successful");
-                                break;
-                        }
-                    }
+                    _logger?.Log($"[DomeStatus] Status check failed on attempt {attempt + 1}", LogLevel.Warning);
+                    if (!domeOk) _logger?.Log("Dome status malformed", LogLevel.Debug);
+                    if (!homeOk) _logger?.Log("Home status malformed", LogLevel.Debug);
+                    if (!parkOk) _logger?.Log("Park status malformed", LogLevel.Debug);
+                    attempt++;
                 }
-                else
+            }
+
+            if (allOk)
+            {
+                CompleteSystemStatus();
+            }
+            else
+            {
+                _logger?.Log("[DomeStatus] Status check failed after retries — raising alarm", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, "Dome status failed after retries");
+                // Optionally: set degraded flags, halt polling, or trigger fallback
+            }
+        }
+
+        public void CompleteSystemStatus()
+        {
+            _logger?.Log($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+            try
+            {
+                _config.ControllerReady = true;
+
+                // Dome status description
+                switch (_config.DomeState)
                 {
-                    if (!domeOk) _logger?.Log("Dome status failed", LogLevel.Debug);
-                    if (!homeOk) _logger?.Log("Home status failed", LogLevel.Debug);
-                    if (!parkOk) _logger?.Log("Park status failed", LogLevel.Debug);
+                    case 0: domeCurrent = "Idle"; break;
+                    case 1: domeCurrent = "Slewing to target"; break;
+                    case 9: domeCurrent = "Slewing to home"; break;
+                    default: domeCurrent = "Unknown state"; break;
+                }
+
+                if (_config.HomeStatus) domeCurrent = "Home";
+                if (_config.ParkStatus) domeCurrent = "Parked";
+
+                // Shutter status description
+                switch (_config.ShutterStatus)
+                {
+                    case 0: shutterCurrent = "Open"; break;
+                    case 1: shutterCurrent = "Closed"; break;
+                    case 2: shutterCurrent = "Opening"; break;
+                    case 3: shutterCurrent = "Closing"; break;
+                    case 4: shutterCurrent = "Error"; break;
+                    case 5: shutterCurrent = "Unknown"; break;
+                    default: shutterCurrent = "Invalid status"; break;
+                }
+
+                LogDomeStatus(domeCurrent, shutterCurrent);
+
+                domeOutputStatus =
+                    $"{_config.DomeState}," +
+                    $"{(_config.HomeStatus ? 1 : 0)}," +
+                    $"{(_config.ParkStatus ? 1 : 0)}," +
+                    $"{_config.Azimuth}," +
+                    $"{_config.TargetAzimuth}," +
+                    $"{(_config.SlewingStatus ? 1 : 0)}," +
+                    $"{_config.ShutterStatus}";
+
+                // Unified completion check
+                if (IsCommandComplete())
+                {
+                    _actionWatchdog?.MarkSuccess();
+                    var completedIntent = _lastIntent;
+                    _lastIntent = DomeCommandIntent.None;
+
+                    // GNS message
+                    switch (completedIntent)
+                    {
+                        case DomeCommandIntent.GoHome:
+                            _GNS.SendGNS(GNSType.Stop, "Dome homed successfully");
+                            break;
+                        case DomeCommandIntent.Park:
+                            _GNS.SendGNS(GNSType.Stop, "Dome parked successfully");
+                            break;
+                        case DomeCommandIntent.OpenShutter:
+                            _GNS.SendGNS(GNSType.Stop, "Shutter opened successfully");
+                            break;
+                        case DomeCommandIntent.CloseShutter:
+                            _GNS.SendGNS(GNSType.Stop, "Shutter closed successfully");
+                            break;
+                        case DomeCommandIntent.SlewAzimuth:
+                            if (changeAzimuth >= _config.JogSize)
+                                _GNS.SendGNS(GNSType.Stop, "Dome slew successful");
+                            break;
+                    }
                 }
             }
             catch (Exception ex)
@@ -980,6 +1002,20 @@ namespace Pulsar_DomeDriver.Driver
 
             _logger?.Log($"Unexpected PARK response: '{raw}'", LogLevel.Debug);
             return false;
+        }
+
+        public void SlewingStatus()
+        {
+            // Slewing status
+            if (_config.ForceBusy)
+            {
+                _config.SlewingStatus = true;
+            }
+            else
+            {
+                bool isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
+                _config.SlewingStatus = !isStationary;
+            }
         }
 
         private bool IsCommandComplete()
@@ -1227,7 +1263,7 @@ namespace Pulsar_DomeDriver.Driver
             _logger?.Log("RESTART command sent (blind). Checking for reboot via shutter status...", LogLevel.Info);
 
             await Task.Delay(_config.pollingIntervalMs * 2);
-            DomeStatus();
+            SystemStatus();
             int initialStatus = _config.ShutterStatus;
 
             if (initialStatus >= 0 && initialStatus <= 3)
@@ -1303,7 +1339,7 @@ namespace Pulsar_DomeDriver.Driver
 
             while (elapsed < timeoutMs)
             {
-                DomeStatus(); // triggers a fresh V read
+                SystemStatus(); // triggers a fresh V read
                 int status = _config.ShutterStatus;
 
                 if (status >= 0 && status <= 3)
@@ -1923,15 +1959,19 @@ double? gnsTimeoutFactor = null)
 
         private bool WaitForControllerReady(string actionLabel)
         {
+            _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+            _logger?.Log($"[WaitForControllerReady] Entered at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
             int waitMs = 0;
             while (!_config.ControllerReady && waitMs < _config.controllerTimeout)
             {
+                _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Trace);
                 Thread.Sleep(_config.pollingIntervalMs);
                 waitMs += _config.pollingIntervalMs;
             }
 
             if (!_config.ControllerReady)
             {
+                _logger?.Log($"[WaitForControllerReady] Timeout reached — ControllerReady still false", LogLevel.Warning);
                 _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
                 RaiseAlarmAndReset($"Controller not ready after {actionLabel}; initiating recovery.");
                 return false;
@@ -2180,7 +2220,7 @@ double? gnsTimeoutFactor = null)
             );
         }
 
-       public void AbortSlew()
+        public void AbortSlew()
         {
             LogDomeStatus("Aborting all movement...", "Aborting all movement...");
 

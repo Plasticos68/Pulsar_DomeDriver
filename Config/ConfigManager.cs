@@ -57,6 +57,7 @@ namespace Pulsar_DomeDriver.Config
         public readonly int shutterSettle = 5000;
         public readonly int serialSettle = 60;
         public readonly int controllerTimeout = 10000;
+        public readonly int statusMaxRetries = 2;       // number of retries for the domestatus before alarm
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;
