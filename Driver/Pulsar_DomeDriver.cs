@@ -41,10 +41,10 @@ namespace Pulsar_DomeDriver.Driver
         private readonly string _generalResponse = "A";
 
         //polling thread for serial comms
-        private CancellationTokenSource _pollingCancel;
-        private volatile bool _pollingActive = false;
-        private readonly object _pollingLock = new object();
-        private Task _pollingTask;
+        private CancellationTokenSource _pollingCancel = null;
+        private bool _pollingActive = false;
+        private readonly object _pollingLock = new();
+        private Task _pollingTask = null;
 
         // Timestamp updated by polling loop
         private DateTime _lastPollTimestamp = DateTime.MinValue;
@@ -452,6 +452,55 @@ namespace Pulsar_DomeDriver.Driver
                     return;
                 }
 
+                if (_pollingActive)
+                {
+                    _logger?.Log("Polling already active. Skipping restart.", LogLevel.Debug);
+                    return;
+                }
+
+                if (_pollingTask != null)
+                {
+                    _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Trace);
+
+                    if (_pollingTask.IsCompleted || _pollingTask.IsFaulted || _pollingTask.IsCanceled)
+                    {
+                        _logger?.Log($"Polling task is stale (status: {_pollingTask.Status}). Resetting.", LogLevel.Debug);
+                        _pollingTask = null;
+                    }
+                }
+
+                _logger?.Log($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
+
+                _pollingCancel?.Cancel();
+                _pollingCancel?.Dispose();
+                _pollingCancel = new CancellationTokenSource();
+
+                _lastPollTimestamp = DateTime.UtcNow;
+
+                try
+                {
+                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token));
+                    _pollingActive = true;
+                    //LogPollingStartupSnapshot();
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Log($"Failed to start polling task: {ex.Message}", LogLevel.Error);
+                    _pollingActive = false;
+                }
+            }
+        }
+
+        public void oldStartPolling()
+        {
+            lock (_pollingLock)
+            {
+                if (_commandInProgress)
+                {
+                    _logger?.Log("Polling start blocked: command in progress.", LogLevel.Debug);
+                    return;
+                }
+
                 if (_pollingTask != null)
                 {
                     _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Trace);
@@ -729,43 +778,49 @@ namespace Pulsar_DomeDriver.Driver
 
         public void SystemStatus()
         {
-            int attempt = 0;
-            bool allOk = false;
-
-            while (attempt <= _config.statusMaxRetries && !allOk)
+            var retryPolicy = new RetryPolicy
             {
-                bool domeOk = ParseDomeStatus();
-                bool homeOk = ParseHomeStatus();
-                bool parkOk = ParseParkStatus();
-                SlewingStatus();
+                MaxAttempts = _config.statusMaxRetries,
+                DelayMs = 100,
+                ExponentialBackoff = false
+            };
 
-                allOk = domeOk && homeOk && parkOk;
-
-                if (!allOk)
+            try
+            {
+                retryPolicy.Execute(() =>
                 {
-                    _logger?.Log($"[DomeStatus] Status check failed on attempt {attempt + 1}", LogLevel.Warning);
-                    if (!domeOk) _logger?.Log("Dome status malformed", LogLevel.Debug);
-                    if (!homeOk) _logger?.Log("Home status malformed", LogLevel.Debug);
-                    if (!parkOk) _logger?.Log("Park status malformed", LogLevel.Debug);
-                    attempt++;
-                }
-            }
+                    bool domeOk = ParseDomeStatus();
+                    bool homeOk = ParseHomeStatus();
+                    bool parkOk = ParseParkStatus();
+                    SlewingStatus();
 
-            if (allOk)
-            {
+                    bool allOk = domeOk && homeOk && parkOk;
+
+                    if (!allOk)
+                    {
+                        _logger?.Log("[DomeStatus] Status check failed", LogLevel.Warning);
+                        if (!domeOk) _logger?.Log("Dome status malformed", LogLevel.Debug);
+                        if (!homeOk) _logger?.Log("Home status malformed", LogLevel.Debug);
+                        if (!parkOk) _logger?.Log("Park status malformed", LogLevel.Debug);
+                    }
+
+                    return allOk;
+
+                }, isSuccess => isSuccess);
+
                 CompleteSystemStatus();
             }
-            else
+            catch (TimeoutException)
             {
                 _logger?.Log("[DomeStatus] Status check failed after retries — raising alarm", LogLevel.Error);
                 _GNS.SendGNS(GNSType.Alarm, "Dome status failed after retries");
-                // Optionally: set degraded flags, halt polling, or trigger fallback
             }
         }
 
         public void CompleteSystemStatus()
         {
             _logger?.Log($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+
             try
             {
                 _config.ControllerReady = true;
@@ -806,13 +861,19 @@ namespace Pulsar_DomeDriver.Driver
                     $"{_config.ShutterStatus}";
 
                 // Unified completion check
-                if (IsCommandComplete())
+                bool complete = IsCommandComplete();
+                if (complete)
                 {
+                    if (_config.ForceBusy)
+                    {
+                        _logger?.Log($"ForceBusy overridden: command {_lastIntent} appears complete based on status.", LogLevel.Debug);
+                        _config.ForceBusy = false;
+                    }
+
                     _actionWatchdog?.MarkSuccess();
                     var completedIntent = _lastIntent;
                     _lastIntent = DomeCommandIntent.None;
 
-                    // GNS message
                     switch (completedIntent)
                     {
                         case DomeCommandIntent.GoHome:
@@ -1020,24 +1081,16 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool IsCommandComplete()
         {
-            bool stateComplete = _lastIntent switch
+            return _lastIntent switch
             {
-                DomeCommandIntent.GoHome => _config.DomeState == 0 && _config.HomeStatus == true,
-                DomeCommandIntent.SlewAzimuth => _config.DomeState == 0 && Math.Abs(_config.TargetAzimuth - _config.SlewAz) <= _config.AzimuthTolerance,
+                DomeCommandIntent.GoHome => _config.DomeState == 0 && _config.HomeStatus,
+                DomeCommandIntent.SlewAzimuth => _config.DomeState == 0 &&
+                    Math.Abs(_config.TargetAzimuth - _config.SlewAz) <= _config.AzimuthTolerance,
                 DomeCommandIntent.OpenShutter => _config.ShutterStatus == 0,
                 DomeCommandIntent.CloseShutter => _config.ShutterStatus == 1,
-                DomeCommandIntent.Park => _config.DomeState == 0 && _config.ParkStatus == true,
+                DomeCommandIntent.Park => _config.DomeState == 0 && _config.ParkStatus,
                 _ => true
             };
-
-            // If ForceBusy is true but state shows complete, log and override
-            if (_config.ForceBusy && stateComplete)
-            {
-                _logger?.Log("ForceBusy overridden: command appears complete based on status.", LogLevel.Trace);
-                _config.ForceBusy = false;
-            }
-
-            return stateComplete;
         }
 
         private void LogDomeStatus(string domeActivity, string shutterActivity)
@@ -1055,6 +1108,41 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
+        public class RetryPolicy
+        {
+            public int MaxAttempts { get; set; } = 3;
+            public int DelayMs { get; set; } = 100;
+            public bool ExponentialBackoff { get; set; } = false;
+
+            public async Task<T> ExecuteAsync<T>(Func<Task<T>> action, Func<T, bool> isSuccess)
+            {
+                for (int attempt = 0; attempt < MaxAttempts; attempt++)
+                {
+                    var result = await action();
+                    if (isSuccess(result)) return result;
+
+                    int delay = ExponentialBackoff ? DelayMs * (1 << attempt) : DelayMs;
+                    await Task.Delay(delay);
+                }
+
+                throw new TimeoutException($"RetryPolicy failed after {MaxAttempts} attempts.");
+            }
+
+            public T Execute<T>(Func<T> action, Func<T, bool> isSuccess)
+            {
+                for (int attempt = 0; attempt < MaxAttempts; attempt++)
+                {
+                    var result = action();
+                    if (isSuccess(result)) return result;
+
+                    int delay = ExponentialBackoff ? DelayMs * (1 << attempt) : DelayMs;
+                    Thread.Sleep(delay);
+                }
+
+                throw new TimeoutException($"RetryPolicy failed after {MaxAttempts} attempts.");
+            }
+        }
+
         #endregion
 
         #region Reset
@@ -1069,31 +1157,34 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
-            CancellationTokenSource? cts = null;
-
             try
             {
-                cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(5000));
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
                 while (_config.WatchdogRunning)
                 {
+                    if (cts.Token.IsCancellationRequested)
+                    {
+                        _logger?.Log("Watchdog stuck — forcing cleanup", LogLevel.Error);
+                        CancelCurrentActionWatchdog();
+                        _actionWatchdog?.Stop();
+                        _actionWatchdog = null;
+                        _config.WatchdogRunning = false;
+                        break;
+                    }
+
                     _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
                     await Task.Delay(500, cts.Token);
                 }
             }
             catch (OperationCanceledException)
             {
-                _logger?.Log("Watchdog wait timed out — forcing stop.", LogLevel.Warning);
+                // Expected if delay is canceled mid-loop
+                _logger?.Log("Watchdog wait canceled — forcing cleanup", LogLevel.Warning);
                 CancelCurrentActionWatchdog();
-                _actionWatchdog?.Stop(); // redundant but explicit
-                _actionWatchdog = null;  // reinforces cleanup
+                _actionWatchdog?.Stop();
+                _actionWatchdog = null;
                 _config.WatchdogRunning = false;
-
-                await Task.Delay(_config.watchDogSettle);
-            }
-            finally
-            {
-                cts?.Dispose();
             }
 
             if (_config.WatchdogRunning)
@@ -1548,44 +1639,40 @@ namespace Pulsar_DomeDriver.Driver
             string command,
             ResponseMode mode,
             IEnumerable<string>? expectedResponses = null,
-            int maxRetries = 2,
-            int retryDelayMs = 100)
+            RetryPolicy? retryPolicy = null)
         {
+            retryPolicy ??= new RetryPolicy
+            {
+                MaxAttempts = _config.sendVerifyMaxRetries,
+                DelayMs = 100,
+                ExponentialBackoff = false
+            };
 
             string response = "";
             bool expectResponse = mode != ResponseMode.Blind;
 
-            // cursor
-            // string response = SendCommand(command, expectResponse);
-
-            for (int attempt = 0; attempt <= maxRetries; attempt++)
+            return retryPolicy.Execute(() =>
             {
                 response = SendCommand(command, expectResponse);
                 _logger?.Log($"Sent - {command} \t got - {response}", LogLevel.Debug);
 
                 if (mode == ResponseMode.Blind)
                 {
-                    return new ResponseResult
-                    {
-                        Response = null,
-                        IsMatch = true,
-                        RetriesUsed = attempt,
-                        Command = command
-                    };
+                    return new ResponseResult { Response = null, IsMatch = true, Command = command };
                 }
 
                 if (mode == ResponseMode.Raw)
                 {
-                    return new ResponseResult
-                    {
-                        Response = response,
-                        IsMatch = true,
-                        RetriesUsed = attempt,
-                        Command = command
-                    };
+                    return new ResponseResult { Response = response, IsMatch = true, Command = command };
                 }
 
-                if (mode == ResponseMode.MatchExact && expectedResponses != null && expectedResponses.Count() == 1)
+                if ((mode == ResponseMode.MatchExact || mode == ResponseMode.MatchAny) && expectedResponses == null)
+                {
+                    _logger?.Log($"Expected responses not provided for mode {mode}.", LogLevel.Error);
+                    return new ResponseResult { Response = response, IsMatch = false, Command = command };
+                }
+
+                if (mode == ResponseMode.MatchExact && expectedResponses?.Count() == 1)
                 {
                     string expected = expectedResponses.First();
                     _logger?.Log($"Expected response was {expected}", LogLevel.Debug);
@@ -1593,19 +1680,8 @@ namespace Pulsar_DomeDriver.Driver
                     if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                     {
                         _logger?.Log("MatchExact succeeded — returning early", LogLevel.Debug);
-                        return new ResponseResult
-                        {
-                            Response = response,
-                            IsMatch = true,
-                            RetriesUsed = attempt,
-                            Command = command
-                        };
+                        return new ResponseResult { Response = response, IsMatch = true, Command = command };
                     }
-                }
-
-                if ((mode == ResponseMode.MatchExact || mode == ResponseMode.MatchAny) && expectedResponses == null)
-                {
-                    _logger?.Log($"Expected responses not provided for mode {mode}.", LogLevel.Error);
                 }
 
                 if (mode == ResponseMode.MatchAny && expectedResponses != null)
@@ -1615,28 +1691,14 @@ namespace Pulsar_DomeDriver.Driver
                         if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                         {
                             _logger?.Log($"Matched one of expected responses: {response}", LogLevel.Debug);
-                            return new ResponseResult
-                            {
-                                Response = response,
-                                IsMatch = true,
-                                RetriesUsed = attempt,
-                                Command = command
-                            };
+                            return new ResponseResult { Response = response, IsMatch = true, Command = command };
                         }
                     }
                 }
 
-                if (attempt < maxRetries)
-                    Thread.Sleep(retryDelayMs);
-            }
+                return new ResponseResult { Response = response, IsMatch = false, Command = command };
 
-            _logger?.Log($"Command '{command}' failed after {maxRetries + 1} attempts. Last response: '{response}'", LogLevel.Error); return new ResponseResult
-            {
-                Response = response,
-                IsMatch = false,
-                RetriesUsed = maxRetries + 1,
-                Command = command
-            };
+            }, result => result.IsMatch);
         }
 
         public void SetupDialog()

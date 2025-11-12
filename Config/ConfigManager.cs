@@ -1,5 +1,6 @@
 ﻿using ASCOM.Utilities;
 using Pulsar_DomeDriver.Diagnostics;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Threading;
@@ -58,6 +59,8 @@ namespace Pulsar_DomeDriver.Config
         public readonly int serialSettle = 60;
         public readonly int controllerTimeout = 10000;
         public readonly int statusMaxRetries = 2;       // number of retries for the domestatus before alarm
+        public readonly int sendVerifyMaxRetries = 2;       // number of retries for the send and verify routine
+
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;
@@ -177,20 +180,19 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string timeoutString = _profile.GetValue(_driverId, "ShutterTimeout", "");
-                bool success = int.TryParse(timeoutString, out int result);
-                if (success)
+                string raw = _profile.GetValue(_driverId, "ShutterTimeout", "90");
+                if (!int.TryParse(raw, out int seconds) || seconds < 10 || seconds > 600)
                 {
-                    return (result);
-                }
-                else
-                {
+                    _logger?.Log($"Invalid ShutterTimeout '{raw}', using 90s", LogLevel.Warning);
                     return 90000;
                 }
+                return seconds * 1000;
             }
             set
             {
-                _profile.WriteValue(_driverId, "ShutterTimeout", value.ToString());
+                if (value < 10000 || value > 600000)
+                    throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
+                _profile.WriteValue(_driverId, "ShutterTimeout", (value / 1000).ToString());
             }
         }
 
@@ -198,20 +200,19 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string timeoutString = _profile.GetValue(_driverId, "RotationTimeout", "");
-                bool success = int.TryParse(timeoutString, out int result);
-                if (success)
+                string raw = _profile.GetValue(_driverId, "RotationTimeout", "90");
+                if (!int.TryParse(raw, out int seconds) || seconds < 10 || seconds > 600)
                 {
-                    return (result);
-                }
-                else
-                {
+                    _logger?.Log($"Invalid RotationTimeout '{raw}', using 90s", LogLevel.Warning);
                     return 90000;
                 }
+                return seconds * 1000;
             }
             set
             {
-                _profile.WriteValue(_driverId, "RotationTimeout", value.ToString());
+                if (value < 10000 || value > 600000)
+                    throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
+                _profile.WriteValue(_driverId, "RotationTimeout", (value / 1000).ToString());
             }
         }
 

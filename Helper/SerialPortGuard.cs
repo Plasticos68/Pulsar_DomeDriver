@@ -17,17 +17,18 @@ namespace Pulsar_DomeDriver.Helper
         private readonly FileLogger _logger;
         private readonly Action _setBusy;
         private readonly Action _clearBusy;
-        private bool _isDisposing = false;
+        private volatile bool _isDisposing = false;
+        private readonly object _disposeLock = new();
 
         public SerialPortGuard(SerialPort port, FileLogger logger, Action setBusy, Action clearBusy)
         {
-            _port = port;
+            _port = port ?? throw new ArgumentNullException(nameof(port));
             _logger = logger;
             _setBusy = setBusy;
             _clearBusy = clearBusy;
         }
 
-        public bool IsReady => !Volatile.Read(ref _isDisposing) && _port != null && _port.IsOpen;
+        public bool IsReady => !_isDisposing && _port?.IsOpen == true;
 
         public string? Send(string command, bool expectResponse = true)
         {
@@ -41,39 +42,37 @@ namespace Pulsar_DomeDriver.Helper
             _gate.Wait();
             _logger?.Log($"Serial gate acquired for: {command}", LogLevel.Trace);
 
-            _setBusy?.Invoke();
-
             try
             {
-                if (!IsReady)
+                if (_isDisposing)
+                    throw new ObjectDisposedException(nameof(SerialPortGuard));
+
+                _setBusy?.Invoke();
+
+                if (_port == null || !_port.IsOpen)
                     throw new ASCOM.NotConnectedException("Serial port is not open.");
 
-                // Optional: settle time before checking buffer
-                Thread.Sleep(60);
-
-                // Check for unexpected leftover data
-                if (_port.BytesToRead > 0)
+                // Aggressive pre-flush with retry
+                for (int i = 0; i < 3; i++)
                 {
+                    _port.DiscardInBuffer();
+                    Thread.Sleep(50);
+                    if (_port.BytesToRead == 0) break;
+
                     string leftover = _port.ReadExisting();
                     if (!string.IsNullOrWhiteSpace(leftover))
-                    {
-                        _logger?.Log($"Warning: unexpected data in serial buffer before sending '{command}': {leftover}", LogLevel.Warning);
-                    }
-                    Thread.Sleep(60); // allow buffer to settle
+                        _logger?.Log($"[FlushAttempt {i + 1}] Unexpected data in buffer before sending '{command}': {leftover}", LogLevel.Warning);
                 }
 
                 _port.DiscardOutBuffer();
-                Thread.Sleep(60); // settle time
+                Thread.Sleep(50); // settle time
 
                 _port.Write($"{command}\r");
                 _logger?.Log($"Sending {command}");
 
                 if (!expectResponse)
-                {
-                    return null; // skip read, avoid error
-                }
+                    return null;
 
-                // Proceed with read and timeout
                 var buffer = new StringBuilder();
                 var timeout = DateTime.Now.AddMilliseconds(750);
                 bool terminatorSeen = false;
@@ -104,7 +103,6 @@ namespace Pulsar_DomeDriver.Helper
                 }
 
                 return raw;
-
             }
             catch (ObjectDisposedException)
             {
@@ -126,11 +124,15 @@ namespace Pulsar_DomeDriver.Helper
             }
 
             await _gate.WaitAsync();
-            _setBusy?.Invoke();
 
             try
             {
-                if (!IsReady)
+                if (_isDisposing)
+                    throw new ObjectDisposedException(nameof(SerialPortGuard));
+
+                _setBusy?.Invoke();
+
+                if (_port == null || !_port.IsOpen)
                     throw new ASCOM.NotConnectedException("Serial port is not open.");
 
                 _port.WriteLine(command);
@@ -151,29 +153,26 @@ namespace Pulsar_DomeDriver.Helper
             }
         }
 
-        private readonly object _disposeLock = new();
-
         public void Dispose()
         {
-            Volatile.Write(ref _isDisposing, true);
+            lock (_disposeLock)
+            {
+                _isDisposing = true;
 
-            try { _port?.Close(); } catch { }
-            try { _port?.Dispose(); } catch { }
-            try { _gate?.Dispose(); } catch { }
+                try { _port?.Close(); } catch { }
+                try { _port?.Dispose(); } catch { }
+                try { _gate?.Dispose(); } catch { }
+            }
         }
 
         private void FlushIfStale(string context)
         {
-            if (_port.BytesToRead > 0)
+            if (_port?.BytesToRead > 0)
             {
                 string leftover = _port.ReadExisting();
                 if (!string.IsNullOrWhiteSpace(leftover))
-                {
                     _logger?.Log($"[{context}] Unexpected data in buffer: {leftover}", LogLevel.Warning);
-                }
             }
         }
-
-
     }
 }
