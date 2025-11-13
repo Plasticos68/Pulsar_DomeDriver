@@ -18,13 +18,12 @@ namespace Pulsar_DomeDriver.Diagnostics
 
         public FileLogger(
             string logFilePath,
-            LogLevel logLevel,
             bool debugEnabled = false,
-            bool traceEnabled = false,
-            MqttPublisher mqttPublisher = null)
+            bool traceEnabled = false
+            /*MqttPublisher mqttPublisher = null*/)
         {
             _logFilePath = logFilePath;
-            _logLevel = logLevel;
+            //_logLevel = logLevel;
             _debugLog = debugEnabled;
             _traceLog = traceEnabled;
 
@@ -47,35 +46,54 @@ namespace Pulsar_DomeDriver.Diagnostics
             Log("Logger initialized.", LogLevel.Info);
         }
 
-        public void Log(string message, LogLevel level = LogLevel.Debug)
+        public void Log(string message, LogLevel level = LogLevel.None)
         {
-            if (level > _logLevel) return;
-
-            if (level == LogLevel.Debug && !_debugLog) return;
-            if (level == LogLevel.Trace && !_traceLog) return;
+            //if (level > _logLevel) return;
+            if (!_traceLog && !_debugLog)
+            {
+                return;
+            }
+            //if (level == LogLevel.Debug && !_debugLog) return;
+            //if (level == LogLevel.Trace && !_traceLog) return;
 
             string label = level switch
             {
-                LogLevel.Error => "ERROR",
-                LogLevel.Warning => "WARNING",
-                LogLevel.Info => "Info",
-                LogLevel.Debug => "DEBUG",
-                LogLevel.Trace => "TRACE",
-                _ => "LOG"
+                LogLevel.Error => "[ERROR]",
+                LogLevel.Warning => "[WARNING]",
+                LogLevel.Info => "[INFO]",
+                LogLevel.Debug => "[DEBUG]",
+                LogLevel.Trace => "[TRACE]",
+                _ => "[LOG]"
             };
 
-            WriteLine(label, message);
+            label = label.PadRight(12); // ensures label is always x characters wide
+
+            WriteLine(label, message, level);
         }
 
-        private void WriteLine(string levelLabel, string message)
+        private void WriteLine(string levelLabel, string message, LogLevel level = LogLevel.None)
         {
-            var timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
-            var threadId = Environment.CurrentManagedThreadId;
+            string cleanedMessage = message.Replace("\r", "").Replace("\t", " - ").TrimEnd();
 
-            lock (_writeLock)
+            var timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            //var threadId = Environment.CurrentManagedThreadId;
+
+            if (level == LogLevel.Trace && _traceLog)
             {
-                _writer.WriteLine($"[{timestamp}] \t{levelLabel}\t[Thread:{threadId}] {message}");
+                lock (_writeLock)
+                {
+                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
+                    return;
+                }
             }
+            else if (_debugLog)
+            {
+                lock (_writeLock)
+                {
+                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
+                }
+            }
+
         }
 
         public void Dispose()

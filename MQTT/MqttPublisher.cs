@@ -21,7 +21,7 @@
 //        public MqttPublisher(FileLogger logger, ConfigManager config)
 //        {
 //            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-//            _logger.Log("[MQTT] MqttPublisher instance created", LogLevel.Trace);
+//            _logger.Log("[MQTT] MqttPublisher instance created", LogLevel.Debug);
 //            _config = config;
 //        }
 
@@ -29,7 +29,7 @@
 
 //        public async Task InitializeAsync(string brokerIp, int port = 1883)
 //        {
-//            _logger.Log("[MQTT] InitializeAsync entered", LogLevel.Trace);
+//            _logger.Log("[MQTT] InitializeAsync entered", LogLevel.Debug);
 
 //            try
 //            {
@@ -69,7 +69,7 @@
 //            {
 //                return;
 //            }
-//            _logger.Log("[MQTT] PublishAsync entered", LogLevel.Trace);
+//            _logger.Log("[MQTT] PublishAsync entered", LogLevel.Debug);
 
 //            if (_client == null)
 //            {
@@ -112,7 +112,7 @@
 
 //        public async Task SubscribeAsync(string topic, Action<string> onMessage)
 //        {
-//            _logger.Log("[MQTT] SubscribeAsync entered", LogLevel.Trace);
+//            _logger.Log("[MQTT] SubscribeAsync entered", LogLevel.Debug);
 
 //            if (_client == null)
 //            {
@@ -131,7 +131,7 @@
 //                try
 //                {
 //                    var payload = Encoding.UTF8.GetString(e.ApplicationMessage.Payload);
-//                    _logger.Log($"[MQTT] Received on '{e.ApplicationMessage.Topic}': {payload}", LogLevel.Trace);
+//                    _logger.Log($"[MQTT] Received on '{e.ApplicationMessage.Topic}': {payload}", LogLevel.Debug);
 //                    onMessage?.Invoke(payload);
 //                }
 //                catch (Exception ex)
@@ -160,7 +160,7 @@
 
 //        public async Task DisconnectAsync()
 //        {
-//            _logger.Log("[MQTT] DisconnectAsync entered", LogLevel.Trace);
+//            _logger.Log("[MQTT] DisconnectAsync entered", LogLevel.Debug);
 
 //            if (_client == null)
 //            {
@@ -214,7 +214,7 @@ namespace Pulsar_DomeDriver.MQTT
         public MqttPublisher(FileLogger logger, ConfigManager config)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _logger.Log("[MQTT] MqttPublisher instance created", LogLevel.Trace);
+            _logger.Log("[MQTT] MqttPublisher instance created", LogLevel.Debug);
             _config = config;
         }
 
@@ -222,7 +222,7 @@ namespace Pulsar_DomeDriver.MQTT
 
         public async Task InitializeAsync(string brokerIp, int port = 1883)
         {
-            _logger.Log("[MQTT] InitializeAsync entered", LogLevel.Trace);
+            _logger.Log("[MQTT] InitializeAsync entered", LogLevel.Debug);
 
             if (_initialized)
             {
@@ -282,7 +282,7 @@ namespace Pulsar_DomeDriver.MQTT
         {
             if (_config.Rebooting) return;
 
-            _logger.Log("[MQTT] PublishAsync entered", LogLevel.Trace);
+            _logger.Log("[MQTT] PublishAsync entered", LogLevel.Debug);
 
             if (_client == null)
             {
@@ -321,7 +321,7 @@ namespace Pulsar_DomeDriver.MQTT
 
         public async Task SubscribeAsync(string topic, Action<string> onMessage)
         {
-            _logger.Log("[MQTT] SubscribeAsync entered", LogLevel.Trace);
+            _logger.Log("[MQTT] SubscribeAsync entered", LogLevel.Debug);
 
             if (_client == null)
             {
@@ -349,7 +349,7 @@ namespace Pulsar_DomeDriver.MQTT
                 try
                 {
                     var payload = Encoding.UTF8.GetString(e.ApplicationMessage.Payload ?? Array.Empty<byte>());
-                    _logger.Log($"[MQTT] Received on '{e.ApplicationMessage.Topic}': {payload}", LogLevel.Trace);
+                    _logger.Log($"[MQTT] Received on '{e.ApplicationMessage.Topic}': {payload}", LogLevel.Debug);
                     if (e.ApplicationMessage.Topic == topic)
                         onMessage?.Invoke(payload);
                 }
@@ -379,7 +379,7 @@ namespace Pulsar_DomeDriver.MQTT
 
         public async Task DisconnectAsync()
         {
-            _logger.Log("[MQTT] DisconnectAsync entered", LogLevel.Trace);
+            _logger.Log("[MQTT] DisconnectAsync entered", LogLevel.Debug);
 
             if (_client == null)
             {

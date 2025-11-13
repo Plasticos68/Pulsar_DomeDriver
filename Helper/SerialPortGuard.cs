@@ -13,6 +13,7 @@ namespace Pulsar_DomeDriver.Helper
     public class SerialPortGuard : IDisposable
     {
         private readonly SerialPort _port;
+        private readonly ConfigManager _config;
         private readonly SemaphoreSlim _gate = new(1, 1);
         private readonly FileLogger _logger;
         private readonly Action _setBusy;
@@ -20,9 +21,10 @@ namespace Pulsar_DomeDriver.Helper
         private volatile bool _isDisposing = false;
         private readonly object _disposeLock = new();
 
-        public SerialPortGuard(SerialPort port, FileLogger logger, Action setBusy, Action clearBusy)
+        public SerialPortGuard(SerialPort port, ConfigManager config, FileLogger logger, Action setBusy, Action clearBusy)
         {
             _port = port ?? throw new ArgumentNullException(nameof(port));
+            _config = config;
             _logger = logger;
             _setBusy = setBusy;
             _clearBusy = clearBusy;
@@ -40,7 +42,7 @@ namespace Pulsar_DomeDriver.Helper
 
             _logger?.Log($"Waiting for serial gate to send: {command}", LogLevel.Debug);
             _gate.Wait();
-            _logger?.Log($"Serial gate acquired for: {command}", LogLevel.Trace);
+            _logger?.Log($"Serial gate acquired for: {command}", LogLevel.Debug);
 
             try
             {
@@ -94,12 +96,21 @@ namespace Pulsar_DomeDriver.Helper
                 }
 
                 string raw = buffer.ToString();
-                _logger?.Log($"Sent - {command} \t received - {raw}", LogLevel.Debug);
+                if (_config.TraceLog)
+                {
+                    string commandPadded = command.PadRight(8);
 
+                    _logger?.Log($"(Sent) : {commandPadded}    (received) : {raw}", LogLevel.Trace);
+                }
+                
                 if (string.IsNullOrWhiteSpace(raw))
                 {
-                    _logger?.Log($"No response received for command: {command}", LogLevel.Error);
-                    throw new IOException($"No response received for command: {command}");
+                    if (_config.TraceLog)
+                    {
+                        string commandPadded = command.PadRight(8);
+                        _logger?.Log($"(Sent) : {commandPadded}    (Received) : ERROR NO RESPONSE", LogLevel.Trace);
+                        throw new IOException($"No response received for command: {command}");
+                    }
                 }
 
                 return raw;

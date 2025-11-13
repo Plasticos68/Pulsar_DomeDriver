@@ -39,7 +39,7 @@ namespace Pulsar_DomeDriver.Config
     {
         public readonly Profile _profile;
         private FileLogger _logger;
-        public ConfigManager(Profile profile, FileLogger logger)
+        public ConfigManager(Profile profile, FileLogger logger = null)
         {
             _profile = profile;
             _logger = logger;

@@ -119,7 +119,9 @@ namespace Pulsar_DomeDriver.Driver
                 _logger?.Log($"Registry DebugLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
 
                 // Initialize logger, config and GNS
-                _logger = new FileLogger(logPath, LogLevel.Trace, debugLog, traceLog, _mqttPublisher);
+                //_logger = new FileLogger(logPath, LogLevel.None, debugLog, traceLog, _mqttPublisher);
+                _logger = new FileLogger(logPath, debugLog, traceLog);
+
                 _config = new ConfigManager(_profile, _logger);
                 _GNS = new GNS(_logger, _config);
 
@@ -266,6 +268,7 @@ namespace Pulsar_DomeDriver.Driver
                 catch (Exception ex)
                 {
                     _logger?.Log($"Failed to open serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
+                    HandleDriverFailure(ex);
                     return false;
                 }
             }
@@ -275,13 +278,14 @@ namespace Pulsar_DomeDriver.Driver
                 // Create the guard immediately after opening
                 _guard = new SerialPortGuard(
                     _port,
+                    _config,
                     _logger,
                     () =>
                     {
                         lock (_pollingLock)
                         {
                             _commandInProgress = true;
-                            _logger?.Log($"[Guard] _commandInProgress = true at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+                            _logger?.Log($"[Guard] _commandInProgress = true at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
                         }
                     },
                     () =>
@@ -289,7 +293,7 @@ namespace Pulsar_DomeDriver.Driver
                         lock (_pollingLock)
                         {
                             _commandInProgress = false;
-                            _logger?.Log($"[Guard] _commandInProgress = false at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+                            _logger?.Log($"[Guard] _commandInProgress = false at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
                         }
                     }
                 );
@@ -408,23 +412,37 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
+        private void HandleDriverFailure(Exception lastException,  string reason = "Unknown", int errorCount = 0)
+        {
+            _logger?.Log($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
+
+            _mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
+            _actionWatchdog?.MarkFailure();
+
+            _pollingActive = false;
+            Connected = false;
+
+            //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
+        }
+
         private void LogConnectionSnapshot()
         {
-            _logger?.Log("=== Dome Driver Connection Snapshot ===", LogLevel.Trace);
+            _logger?.Log("=== Dome Driver Connection Snapshot ===", LogLevel.Debug);
 
-            _logger?.Log($"PollingActive: {_pollingActive}", LogLevel.Trace);
-            _logger?.Log($"PollingTask status: {_pollingTask?.Status}", LogLevel.Trace);
-            _logger?.Log($"CommandInProgress: {_commandInProgress}", LogLevel.Trace);
-            _logger?.Log($"Rebooting: {_rebooting}", LogLevel.Trace);
-            _logger?.Log($"ResetInProgress: {_config.Resetting}", LogLevel.Trace);
-            _logger?.Log($"LastPollTimestamp: {_lastPollTimestamp:HH:mm:ss.fff}", LogLevel.Trace);
-            _logger?.Log($"ShutterStatus: {_config.ShutterStatus}", LogLevel.Trace);
-            _logger?.Log($"DomeState: {_config.DomeState}", LogLevel.Trace);
-            _logger?.Log($"HomeStatus: {_config.HomeStatus}", LogLevel.Trace);
-            _logger?.Log($"ParkStatus: {_config.ParkStatus}", LogLevel.Trace);
-            _logger?.Log("=======================================", LogLevel.Trace);
+            _logger?.Log($"PollingActive: {_pollingActive}", LogLevel.Debug);
+            _logger?.Log($"PollingTask status: {_pollingTask?.Status}", LogLevel.Debug);
+            _logger?.Log($"CommandInProgress: {_commandInProgress}", LogLevel.Debug);
+            _logger?.Log($"Rebooting: {_rebooting}", LogLevel.Debug);
+            _logger?.Log($"ResetInProgress: {_config.Resetting}", LogLevel.Debug);
+            _logger?.Log($"LastPollTimestamp: {_lastPollTimestamp:HH:mm:ss.fff}", LogLevel.Debug);
+            _logger?.Log($"ShutterStatus: {_config.ShutterStatus}", LogLevel.Debug);
+            _logger?.Log($"DomeState: {_config.DomeState}", LogLevel.Debug);
+            _logger?.Log($"HomeStatus: {_config.HomeStatus}", LogLevel.Debug);
+            _logger?.Log($"ParkStatus: {_config.ParkStatus}", LogLevel.Debug);
+            _logger?.Log("=======================================", LogLevel.Debug);
 
         }
+
 
         #endregion
 
@@ -462,7 +480,7 @@ namespace Pulsar_DomeDriver.Driver
 
                 if (_pollingTask != null)
                 {
-                    _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Trace);
+                    _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Debug);
 
                     if (_pollingTask.IsCompleted || _pollingTask.IsFaulted || _pollingTask.IsCanceled)
                     {
@@ -488,6 +506,7 @@ namespace Pulsar_DomeDriver.Driver
                 catch (Exception ex)
                 {
                     _logger?.Log($"Failed to start polling task: {ex.Message}", LogLevel.Error);
+                    HandleDriverFailure(ex);
                     _pollingActive = false;
                 }
             }
@@ -521,7 +540,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task PollLoopAsync(CancellationToken token)
         {
-            _logger?.Log("Polling loop heartbeat", LogLevel.Trace);
+            _logger?.Log("Polling loop heartbeat", LogLevel.Debug);
             int cycleCount = 0;
             bool commandWasActive;
             bool rebootWasActive;
@@ -535,7 +554,7 @@ namespace Pulsar_DomeDriver.Driver
                     rebootWasActive = _config.Rebooting;
                 }
 
-                _logger?.Log($"[PollLoop] commandWasActive={commandWasActive}, rebootWasActive={rebootWasActive}, elapsed={startupWaitMs} ms", LogLevel.Trace);
+                _logger?.Log($"[PollLoop] commandWasActive={commandWasActive}, rebootWasActive={rebootWasActive}, elapsed={startupWaitMs} ms", LogLevel.Debug);
 
                 if (!commandWasActive && !rebootWasActive)
                     break;
@@ -600,7 +619,7 @@ namespace Pulsar_DomeDriver.Driver
                                 _lastIntent = DomeCommandIntent.None;
                             }
 
-                            _logger?.Log($"Polling cycle at {DateTime.UtcNow:HH:mm:ss}, interval {interval} ms.", LogLevel.Trace);
+                            _logger?.Log($"Polling cycle at {DateTime.UtcNow:HH:mm:ss}, interval {interval} ms.", LogLevel.Debug);
                         }
                         catch (Exception ex)
                         {
@@ -609,8 +628,8 @@ namespace Pulsar_DomeDriver.Driver
 
                             if (errorCount >= _config.pollingLoopRetries)
                             {
-                                _logger?.Log($"Polling error threshold reached ({_config.pollingLoopRetries}). Invoking PollingLoopFailure().", LogLevel.Warning);
-                                HandleDriverFailure(ex, errorCount);
+                                string reason = $"Polling error threshold reached ({_config.pollingLoopRetries}). Invoking PollingLoopFailure().";
+                                HandleDriverFailure(ex, reason,errorCount);
                                 break;
                             }
 
@@ -640,25 +659,13 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
+                HandleDriverFailure(ex);
                 _logger?.Log($"Polling thread terminated unexpectedly: {ex.Message}", LogLevel.Debug);
             }
             finally
             {
                 _logger?.Log($"Polling thread exited cleanly. Last cancellation state: {token.IsCancellationRequested}", LogLevel.Debug);
             }
-        }
-
-        private void HandleDriverFailure(Exception lastException, int errorCount = 0, string reason = "Unknown")
-        {
-            _logger?.Log($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
-
-            _mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
-            _actionWatchdog?.MarkFailure();
-
-            _pollingActive = false;
-            Connected = false;
-
-            //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
         }
 
         private void StartWatchdog()
@@ -685,7 +692,7 @@ namespace Pulsar_DomeDriver.Driver
                             string heartbeat = $"Alive at {utcTime}";
                             TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
                             //await _mqttPublisher.PublishAsync("dome/status", domeOutputStatus);
-                            //_logger?.Log($"[Watchdog] Heartbeat published: {heartbeat}", LogLevel.Trace);
+                            //_logger?.Log($"[Watchdog] Heartbeat published: {heartbeat}", LogLevel.Debug);
                         }
                         else
                         {
@@ -710,7 +717,8 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     catch (Exception ex)
                     {
-                        _logger?.Log($"Polling watchdog error: {ex.Message}", LogLevel.Error);
+                        string reason = $"Polling watchdog error.";
+                        HandleDriverFailure(ex, reason);
                     }
                 }
 
@@ -730,7 +738,8 @@ namespace Pulsar_DomeDriver.Driver
                 }
                 catch (Exception ex)
                 {
-                    _logger?.Log($"Error cancelling watchdog: {ex.Message}", LogLevel.Error);
+                    string reason = $"Error cancelling watchdog.";
+                    HandleDriverFailure(ex, reason);
                 }
                 _systemWatchdogCts.Dispose();
                 _systemWatchdogCts = null;
@@ -776,16 +785,17 @@ namespace Pulsar_DomeDriver.Driver
 
                 CompleteSystemStatus();
             }
-            catch (TimeoutException)
+            catch (TimeoutException ex)
             {
-                _logger?.Log("[DomeStatus] Status check failed after retries — raising alarm", LogLevel.Error);
+                string reason = $"Dome status failed after retries.";
+                HandleDriverFailure(ex, reason);
                 _GNS.SendGNS(GNSType.Alarm, "Dome status failed after retries");
             }
         }
 
         public void CompleteSystemStatus()
         {
-            _logger?.Log($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+            _logger?.Log($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
 
             try
             {
@@ -870,7 +880,8 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                _logger?.Log($"DomeStatus error: {ex.Message}", LogLevel.Debug);
+                string reason = $"DomeStatus error.";
+                HandleDriverFailure(ex, reason);
             }
         }
 
@@ -923,7 +934,7 @@ namespace Pulsar_DomeDriver.Driver
                     throw new ArgumentOutOfRangeException("TargetAzimuth", targetAzimuth, "Must be between -179 and 539");
 
                 double normalizedTarget = (targetAzimuth % 360 + 360) % 360;
-                _logger?.Log($"Target azimuth: raw={targetAzimuth}, normalized={normalizedTarget}", LogLevel.Trace);
+                _logger?.Log($"Target azimuth: raw={targetAzimuth}, normalized={normalizedTarget}", LogLevel.Debug);
 
                 if (!int.TryParse(tokens[4], out int motorDir) || motorDir < 0 || motorDir > 2)
                     throw new ArgumentOutOfRangeException("MotorDir", motorDir, "Must be 0, 1, or 2");
@@ -1146,7 +1157,7 @@ namespace Pulsar_DomeDriver.Driver
                         break;
                     }
 
-                    _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Trace);
+                    _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Debug);
                     await Task.Delay(500, cts.Token);
                 }
             }
@@ -1265,10 +1276,10 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                string exMessage = $"ResetRoutine encountered unexpected error: {ex.Message}";
-                _logger?.Log(exMessage, LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, exMessage);
-                TryMQTTPublish(_mqttAlarm, exMessage);
+                string reason = $"ResetRoutine error.";
+                HandleDriverFailure(ex, reason);
+                _GNS.SendGNS(GNSType.Alarm, reason);
+                TryMQTTPublish(_mqttAlarm, reason);
             }
             finally
             {
@@ -1603,7 +1614,7 @@ namespace Pulsar_DomeDriver.Driver
                 throw new ASCOM.NotConnectedException("Serial port is not ready.");
             }
 
-            _logger?.Log($"Dispatching command: {command} (ExpectResponse={expectResponse})", LogLevel.Trace);
+            _logger?.Log($"Dispatching command: {command} (ExpectResponse={expectResponse})", LogLevel.Debug);
 
             return _guard.Send(command, expectResponse);
         }
@@ -1677,7 +1688,7 @@ namespace Pulsar_DomeDriver.Driver
         public void SetupDialog()
         {
             var profile = new Profile { DeviceType = "Dome" };
-            using (var logger = new FileLogger(Path.Combine(Path.GetTempPath(), "PPBA_DomeSettingsForm.log"), LogLevel.Error))
+            using (var logger = new FileLogger(Path.Combine(Path.GetTempPath(), "PPBA_DomeSettingsForm.log"), _config.DebugLog, _config.TraceLog))
             {
                 var configForUI = new ConfigManager(profile, logger);
                 using (var form = new SettingsForm(configForUI))
@@ -1994,12 +2005,12 @@ double? gnsTimeoutFactor = null)
 
         private bool WaitForControllerReady(string actionLabel)
         {
-            _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+            _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
             _logger?.Log($"[WaitForControllerReady] Entered at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
             int waitMs = 0;
             while (!_config.ControllerReady && waitMs < _config.controllerTimeout)
             {
-                _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Trace);
+                _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Debug);
                 Thread.Sleep(_config.pollingIntervalMs);
                 waitMs += _config.pollingIntervalMs;
             }
@@ -2388,9 +2399,9 @@ double? gnsTimeoutFactor = null)
             try
             {
                 using var profile = new ASCOM.Utilities.Profile { DeviceType = "Dome" };
-                var logger = new FileLogger("PulsarDome_Registration", LogLevel.Error); // Or null if logging isn't needed here
+                //var logger = new FileLogger("PulsarDome_Registration", _config.DebugLog, _config.TraceLog); // Or null if logging isn't needed here
 
-                var config = new ConfigManager(profile, logger);
+                var config = new ConfigManager(profile);
                 config.RegistryEntries();
             }
             catch (Exception ex)
