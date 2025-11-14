@@ -77,6 +77,9 @@ namespace Pulsar_DomeDriver.UI
             txtBoxCycleDelay.Text = (_config.CycleDelay / 1000).ToString();
 
             txtBoxCycleDelay.Enabled = checkBoxExternalReset.Checked;
+
+            txtBoxMQTTip.Text = _config.MQTTip;
+            txtBoxMQTTport.Text = _config.MQTTport;
         }
 
         private void btnOK_Click(object sender, EventArgs e)
@@ -94,22 +97,24 @@ namespace Pulsar_DomeDriver.UI
             _config.UseGNS = chkBoxGNS.Checked;
             _config.GNSPath = txtBoxGNSLocation.Text;
             _config.GNSDispatcherPath = txtBoxGNSDispatherLocation.Text;
+            _config.MQTTip = txtBoxMQTTip.Text;
+            _config.MQTTport = txtBoxMQTTport.Text;
 
             if (int.TryParse(txtBoxResetDelay.Text, out int resetDelay))
             {
-                _config.ResetDelay = (resetDelay * 1000);
+                _config.ResetDelay = (resetDelay);
             }
             if (int.TryParse(txtBoxShutterTimeout.Text, out int shutterTimeout))
             {
-                _config.ShutterTimeout = (shutterTimeout * 1000);
+                _config.ShutterTimeout = (shutterTimeout);
             }
             if (int.TryParse(txtBoxRotationTimeout.Text, out int rotationTimeout))
             {
-                _config.RotationTimeout = (rotationTimeout * 1000);
+                _config.RotationTimeout = (rotationTimeout);
             }
             if (int.TryParse(txtBoxCycleDelay.Text, out int cycleDelay))
             {
-                _config.CycleDelay = (cycleDelay * 1000);
+                _config.CycleDelay = (cycleDelay);
             }
             DialogResult = DialogResult.OK;
             Close();
@@ -151,6 +156,12 @@ namespace Pulsar_DomeDriver.UI
 
         private void checkBoxUseInternalReset_CheckedChanged(object sender, EventArgs e)
         {
+        }
+
+        private void chkBoxMQTT_CkeckedChanged(object sender, EventArgs e)
+        {
+            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked;
+            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked;
         }
 
         private void chkBoxGNS_CheckedChanged(object sender, EventArgs e)

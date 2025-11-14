@@ -15,10 +15,13 @@ namespace Pulsar_DomeDriver.Goodnight
         Cease
     }
 
-    public class GNS
+    public class GNS : IDisposable
+
     {
         private readonly FileLogger _logger;
         private readonly ConfigManager _config;
+        private readonly object _disposeLock = new();
+        private volatile bool _disposed = false;
 
         public GNS(FileLogger logger, ConfigManager config)
         {
@@ -45,11 +48,11 @@ namespace Pulsar_DomeDriver.Goodnight
                     }
                 }
 
-                _logger?.Log($"GNS dispatched: '{message}' (type: {type}, formatted: {formatted})", LogLevel.Info);
+                SafeLog($"GNS dispatched: '{message}' (type: {type}, formatted: {formatted})", LogLevel.Info);
             }
             catch (Exception ex)
             {
-                _logger?.Log($"Failed to send GNS message via pipe: {ex.Message}", LogLevel.Error);
+                SafeLog($"Failed to send GNS message via pipe: {ex.Message}", LogLevel.Error);
             }
         }
 
@@ -67,6 +70,27 @@ namespace Pulsar_DomeDriver.Goodnight
                 GNSType.Cease => $"{action}|{safeMessage}|-2",
                 _ => $"{action}|{safeMessage}"
             };
+        }
+
+        public void Dispose()
+        {
+            lock (_disposeLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                // No owned resources to dispose — just mark as disposed
+                SafeLog("GNS disposed.", LogLevel.Info);
+            }
+        }
+
+
+
+        private void SafeLog(string message, LogLevel level)
+        {
+            if (_disposed) return;
+            try { _logger?.Log(message, level); }
+            catch { /* suppress logging errors during disposal */ }
         }
     }
 }

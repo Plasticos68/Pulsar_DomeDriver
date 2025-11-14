@@ -36,10 +36,11 @@ namespace Pulsar_DomeDriver.Config
     }
 
     public class ConfigManager
+
     {
         public readonly Profile _profile;
         private FileLogger _logger;
-        public ConfigManager(Profile profile, FileLogger logger)
+        public ConfigManager(Profile profile, FileLogger logger = null)
         {
             _profile = profile;
             _logger = logger;
@@ -57,17 +58,17 @@ namespace Pulsar_DomeDriver.Config
         public readonly int watchDogSettle = 100;
         public readonly int shutterSettle = 5000;
         public readonly int serialSettle = 60;
+        public readonly int initialPingDelay = 250;
         public readonly int controllerTimeout = 10000;
         public readonly int statusMaxRetries = 2;       // number of retries for the domestatus before alarm
-        public readonly int sendVerifyMaxRetries = 2;       // number of retries for the send and verify routine
-        public readonly int  pollingLoopRetries = 5;
-
+        public readonly int sendVerifyMaxRetries = 5;       // number of retries for the send and verify routine
+        public readonly int pollingLoopRetries = 5;
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;
         public double Azimuth { get; set; }
         public double AzimuthTolerance { get; set; } = 0; // allowablw error for azimuth
-        public bool SlewingStatus { get; set; } = false;
+        //public bool SlewingStatus { get; set; } = false;
         public bool ParkStatus { get; set; } // 0=Not Parked, 1=Parked
         public bool HomeStatus { get; set; } = false; // 0 = Not Homed, 1 = Homed
         public int DomeState { get; set; } // 0=Idle, 1=Moving to target, 9=Going home
@@ -155,7 +156,7 @@ namespace Pulsar_DomeDriver.Config
             {
                 string delayString = _profile.GetValue(_driverId, "ResetDelay", "");
                 bool success = int.TryParse(delayString, out int result);
-                return success ? result : 5;
+                return success ? result * 1000: 5;
             }
             set
             {
@@ -169,7 +170,7 @@ namespace Pulsar_DomeDriver.Config
             {
                 string delayString = _profile.GetValue(_driverId, "CycleDelay", "");
                 bool success = int.TryParse(delayString, out int result);
-                return success ? result : 5;
+                return success ? result * 1000: 5;
             }
             set
             {
@@ -191,9 +192,9 @@ namespace Pulsar_DomeDriver.Config
             }
             set
             {
-                if (value < 10000 || value > 600000)
+                if (value < 10 || value > 600)
                     throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
-                _profile.WriteValue(_driverId, "ShutterTimeout", (value / 1000).ToString());
+                _profile.WriteValue(_driverId, "ShutterTimeout", (value).ToString());
             }
         }
 
@@ -211,9 +212,9 @@ namespace Pulsar_DomeDriver.Config
             }
             set
             {
-                if (value < 10000 || value > 600000)
+                if (value < 10 || value > 600)
                     throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
-                _profile.WriteValue(_driverId, "RotationTimeout", (value / 1000).ToString());
+                _profile.WriteValue(_driverId, "RotationTimeout", (value).ToString());
             }
         }
 
@@ -259,6 +260,18 @@ namespace Pulsar_DomeDriver.Config
             }
         }
 
+        public string MQTTip
+        {
+            get => _profile.GetValue(_driverId, "MQTTIP", "") ?? "10.17.1.92";
+            set => _profile.WriteValue(_driverId, "MQTTIP", value, "");
+        }
+
+        public string MQTTport
+        {
+            get => _profile.GetValue(_driverId, "MQTTPort", "") ?? "1883";
+            set => _profile.WriteValue(_driverId, "MQTTPort", value, "");
+        }
+
         public bool UseGNS
         {
             get
@@ -293,6 +306,20 @@ namespace Pulsar_DomeDriver.Config
         private int _forceBusyInt = 0;
         private int _controllerReadyInt = 0;
         private int _watchdogRunningInt = 0;
+        private int _commandInProgressInt = 0;
+        private int _slewingStatusInt = 0;
+
+        public bool SlewingStatus
+        {
+            get => Interlocked.CompareExchange(ref _slewingStatusInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _slewingStatusInt, value ? 1 : 0);
+        }
+
+        public bool CommandInProgress
+        {
+            get => Interlocked.CompareExchange(ref _commandInProgressInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _commandInProgressInt, value ? 1 : 0);
+        }
 
         public bool Rebooting
         {
@@ -323,7 +350,6 @@ namespace Pulsar_DomeDriver.Config
             get => Interlocked.CompareExchange(ref _watchdogRunningInt, 0, 0) == 1;
             set => Interlocked.Exchange(ref _watchdogRunningInt, value ? 1 : 0);
         }
-
 
         public bool SoftResetAttempted { get; set; } = false;
 
@@ -358,7 +384,9 @@ namespace Pulsar_DomeDriver.Config
                     ("MQTT", "false"),
                     ("GNS", "false"),
                     ("GNSPath", ""),
-                    ("GNSDispatcherPath", "")
+                    ("GNSDispatcherPath", ""),
+                    ("MQTTIP", "10.17.1.92"),
+                    ("MQTTPort", "1883")
                 };
 
             foreach (var (name, value) in rootEntries)
@@ -380,3 +408,4 @@ namespace Pulsar_DomeDriver.Config
 
     }
 }
+

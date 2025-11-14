@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 
 namespace Pulsar_DomeDriver.Helper
 {
-    public class ActionWatchdog
+    public class ActionWatchdog : IDisposable
     {
         private readonly ConfigManager _config;
         private readonly TimeSpan _timeout;
@@ -26,6 +26,9 @@ namespace Pulsar_DomeDriver.Helper
         private TaskCompletionSource<WatchdogResult> _tcs;
 
         public bool IsRunning => _tcs != null && !_tcs.Task.IsCompleted;
+
+        private volatile bool _disposed = false;
+        private readonly object _disposeLock = new();
 
         public enum WatchdogResult
         {
@@ -144,8 +147,6 @@ namespace Pulsar_DomeDriver.Helper
                 _config.ForceBusy = false; // ensure it's always cleared
                 Stop();
             }
-
-
         }
 
         public void MarkSuccess()
@@ -196,6 +197,24 @@ namespace Pulsar_DomeDriver.Helper
             if (_mqttPublisher != null && _mqttTopic != null)
             {
                 await _mqttPublisher.PublishAsync(_mqttTopic, _longAction);
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_disposeLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                try
+                {
+                    _internalCts?.Cancel();
+                    _internalCts?.Dispose();
+                }
+                catch { /* suppress disposal errors */ }
+
+                _tcs = null;
             }
         }
 
