@@ -18,7 +18,6 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 using SerialPortGuard = Pulsar_DomeDriver.Helper.SerialPortGuard;
 
 namespace Pulsar_DomeDriver.Driver
@@ -41,12 +40,6 @@ namespace Pulsar_DomeDriver.Driver
         private readonly string _pingResponse = "Y159";
         private readonly string _generalResponse = "A";
 
-        // extras
-        private readonly object _resetLock = new();
-        private readonly object _mqttLock = new();
-        private readonly object _actionLock = new();
-        private readonly object _watchdogLock = new object();
-
         //polling thread for serial comms
         private CancellationTokenSource _pollingCancel = null;
         private bool _pollingActive = false;
@@ -61,14 +54,9 @@ namespace Pulsar_DomeDriver.Driver
         private Task? _systemWatchdogTask;
         private readonly TimeSpan _systemWatchdogInterval = TimeSpan.FromSeconds(5);         // How often to check
         private readonly TimeSpan _pollingStallThreshold = TimeSpan.FromSeconds(10);
-        //private volatile bool _config.CommandInProgress = false;
+        private volatile bool _commandInProgress = false;
         private bool _rebooting = false;
         private int _watchdogGeneration = 0;
-        private readonly object _alarmTimerLock = new();
-        private CancellationTokenSource _alarmTimerCts;
-        private Task _alarmTimerTask;
-        private DateTime _lastWatchdogPing = DateTime.UtcNow;
-        private readonly TimeSpan _alarmTimeout = TimeSpan.FromSeconds(30); // or 2× watchdog interval
 
         // Dome/Shutter status variables
         private string oldDomeActivity;
@@ -90,19 +78,11 @@ namespace Pulsar_DomeDriver.Driver
         string _mqttStatus = "Dome/DriverStatus";
         string _mqttDomeStatus = "Dome/Dome/Status";
         string _mqttShutterStatus = "Dome/Shutter/Status";
-        string _mqttAlarm = "Dome/Alarm/Status";
-        string _mqttAlarmMessage = "Dome/Alarm/Message";
+        string _mqttAlarm = "Dome/Alarm";
         string _mqttWatchdog = "Dome/Watchdog";
 
         // GNS
         private GNS _GNS;
-
-        // Dsiposal etc
-        private volatile bool _disposed = false;
-
-        // alarm
-        private volatile bool _alarmTriggered = false;
-        private readonly object _alarmLock = new();
 
         #endregion
 
@@ -127,19 +107,21 @@ namespace Pulsar_DomeDriver.Driver
                     );
                 }
                 string logPath = Path.Combine(regLogPath, "Pulsar_DomeDriver.log");
-                SafeLog($"Registry LogLocation = '{regLogPath}'", LogLevel.Debug);
+                _logger?.Log($"Registry LogLocation = '{regLogPath}'", LogLevel.Debug);
 
                 // Resolve debug flag
                 string debugRaw = _profile.GetValue(driverId, "DebugLog", "");
                 bool debugLog = string.Equals(debugRaw, "true", StringComparison.OrdinalIgnoreCase);
-                SafeLog($"Registry DebugLog = '{debugRaw}' → parsed as {debugLog}", LogLevel.Debug);
+                _logger?.Log($"Registry DebugLog = '{debugRaw}' → parsed as {debugLog}", LogLevel.Debug);
 
                 string traceRaw = _profile.GetValue(driverId, "TraceLog", "");
                 bool traceLog = string.Equals(traceRaw, "true", StringComparison.OrdinalIgnoreCase);
-                SafeLog($"Registry DebugLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
+                _logger?.Log($"Registry DebugLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
 
                 // Initialize logger, config and GNS
+                //_logger = new FileLogger(logPath, LogLevel.None, debugLog, traceLog, _mqttPublisher);
                 _logger = new FileLogger(logPath, debugLog, traceLog);
+
                 _config = new ConfigManager(_profile, _logger);
                 _GNS = new GNS(_logger, _config);
 
@@ -152,7 +134,7 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                SafeLog($"Driver initialization failed: {ex}", LogLevel.Error);
+                _logger?.Log($"Driver initialization failed: {ex}", LogLevel.Error);
                 throw;
             }
         }
@@ -172,8 +154,8 @@ namespace Pulsar_DomeDriver.Driver
                     DataBits = 8,
                     StopBits = StopBits.One,
                     Handshake = Handshake.None,
-                    ReadTimeout = 500,
-                    WriteTimeout = 500
+                    ReadTimeout = 2000,
+                    WriteTimeout = 2000
                 };
             }
         }
@@ -187,7 +169,7 @@ namespace Pulsar_DomeDriver.Driver
                 {
                     if (value && _connected)
                     {
-                        SafeLog("Already connected. Skipping reinitialization.", LogLevel.Debug);
+                        _logger?.Log("Already connected. Skipping reinitialization.", LogLevel.Debug);
                         return;
                     }
 
@@ -205,12 +187,11 @@ namespace Pulsar_DomeDriver.Driver
                                 //StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
                                 Task.Run(async () => await StartMQTTAsync()).Wait();
                                 //TryMQTTPublish(_mqttStatus, "Driver connected");
-                                ResetAlarmMonitor();
-                                StartSystemMonitors();
+                                StartWatchdog();
                             }
                             catch (Exception ex)
                             {
-                                SafeLog($"MQTT startup failed: {ex.Message}", LogLevel.Error);
+                                _logger?.Log($"MQTT startup failed: {ex.Message}", LogLevel.Error);
                                 throw new ASCOM.NotConnectedException("MQTT startup failed.");
                             }
                         }
@@ -230,38 +211,18 @@ namespace Pulsar_DomeDriver.Driver
                         StopWatchdog();
                         if (pollingStopped)
                         {
-                            Task pollingWaitTask = null;
-                            if (pollingStopped && _pollingTask != null)
+                            if (_pollingTask != null)
                             {
-                                pollingWaitTask = _pollingTask;
+                                _pollingTask.Wait();      // Waits for polling task to finish (synchronously)
+                                Thread.Sleep(_config.serialSettle);         // Optional buffer to let serial port settle
                             }
-
-                            // Release lock before waiting
-                            lock (_pollingLock)
-                            {
-                                _connected = false;
-                            }
-
-                            if (pollingWaitTask != null)
-                            {
-                                if (!pollingWaitTask.Wait(3000)) // timeout in ms
-                                {
-                                    SafeLog("Polling task did not complete within timeout — continuing disconnect.", LogLevel.Warning);
-                                }
-                                else
-                                {
-                                    SafeLog("Polling task stopped successfully.", LogLevel.Debug);
-                                }
-
-                                Thread.Sleep(_config.serialSettle); // Optional settle delay
-                            }
-                            SafeLog("Polling task stopped successfully.", LogLevel.Debug);
+                            _logger?.Log("Polling task stopped successfully.", LogLevel.Debug);
                         }
                         if (_mqttPublisher != null && _mqttPublisher.IsConnected)
                         {
                             Task.Run(async () => await _mqttPublisher.PublishAsync(_mqttStatus, "Driver disconnected"));
                             Task.Run(async () => await _mqttPublisher.DisconnectAsync());
-                            SafeLog("MQTT disconnected", LogLevel.Info);
+                            _logger?.Log("MQTT disconnected", LogLevel.Info);
                         }
 
 
@@ -270,13 +231,13 @@ namespace Pulsar_DomeDriver.Driver
                         {
                             _connected = false;
                         }
-                        SafeLog("Disconnect initiated.", LogLevel.Info);
+                        _logger?.Log("Disconnect initiated.", LogLevel.Info);
                         var start = DateTime.UtcNow;
 
                         DisconnectController();
 
                         var elapsed = DateTime.UtcNow - start;
-                        SafeLog($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
+                        _logger?.Log($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
                         _GNS.SendGNS(GNSType.Message, "Dome driver disconnected");
                     }
                 }
@@ -287,13 +248,13 @@ namespace Pulsar_DomeDriver.Driver
         {
             if (_port == null)
             {
-                SafeLog("Serial port not initialized. Did InitializeSerialPort run?", LogLevel.Error);
+                _logger?.Log("Serial port not initialized. Did InitializeSerialPort run?", LogLevel.Error);
                 throw new ASCOM.NotConnectedException("Serial port is not initialized.");
             }
 
             if (string.IsNullOrWhiteSpace(_port.PortName))
             {
-                SafeLog("Connection attempt but Serial Port name is missing.", LogLevel.Error);
+                _logger?.Log("Connection attempt but Serial Port name is missing.", LogLevel.Error);
                 throw new ASCOM.NotConnectedException("Serial port name is missing. Please run Setup.");
             }
 
@@ -302,11 +263,12 @@ namespace Pulsar_DomeDriver.Driver
                 try
                 {
                     _port.Open();
-                    SafeLog($"Serial port {_port.PortName} opened.", LogLevel.Info);
+                    _logger?.Log($"Serial port {_port.PortName} opened.", LogLevel.Info);
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"Failed to open serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
+                    _logger?.Log($"Failed to open serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
+                    HandleDriverFailure(ex);
                     return false;
                 }
             }
@@ -316,59 +278,57 @@ namespace Pulsar_DomeDriver.Driver
                 // Create the guard immediately after opening
                 _guard = new SerialPortGuard(
                     _port,
+                    _config,
                     _logger,
                     () =>
                     {
                         lock (_pollingLock)
                         {
-                            _config.CommandInProgress = true;
-                            SafeLog($"[Guard] CommandInProgress = true at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
+                            _commandInProgress = true;
+                            _logger?.Log($"[Guard] _commandInProgress = true at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
                         }
                     },
                     () =>
                     {
                         lock (_pollingLock)
                         {
-                            _config.CommandInProgress = false;
-                            SafeLog($"[Guard] CommandInProgress = false at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
+                            _commandInProgress = false;
+                            _logger?.Log($"[Guard] _commandInProgress = false at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
                         }
                     }
                 );
             }
             catch (Exception ex)
             {
-                SafeLog($"Failed to create SerialPortGuard: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"Failed to create SerialPortGuard: {ex.Message}", LogLevel.Error);
                 _port.Close();
                 _guard = null;
-                SafeLog("Serial port closed due to guard creation failure.", LogLevel.Info);
+                _logger?.Log("Serial port closed due to guard creation failure.", LogLevel.Info);
                 return false;
             }
 
-            //Thread.Sleep(_config.initialPingDelay);
-
             for (int attempt = 0; attempt < 2; attempt++)
             {
-                //_guard.Send("NOP", false); // Arduino ignores this
-                //Thread.Sleep(700);
                 if (_guard != null && PingController())
                 {
-                    SafeLog("Connected ok", LogLevel.Info);
+                    _logger?.Log("Connected ok", LogLevel.Info);
                     return true;
                 }
 
-                //Thread.Sleep(100); // between attempts
+                Thread.Sleep(100); // between attempts
 
                 if (attempt == 1)
                 {
-                    SafeLog("Ping failed after 2 attempts.", LogLevel.Error);
+                    _logger?.Log("Ping failed after 2 attempts.", LogLevel.Error);
+
                     try
                     {
                         _port.Close();
-                        SafeLog("Serial port closed after failed ping.", LogLevel.Debug);
+                        _logger?.Log("Serial port closed after failed ping.", LogLevel.Debug);
                     }
                     catch (Exception ex)
                     {
-                        SafeLog($"Error closing serial port: {ex.Message}", LogLevel.Error);
+                        _logger?.Log($"Error closing serial port: {ex.Message}", LogLevel.Error);
                     }
 
                     if (_guard != null)
@@ -376,15 +336,16 @@ namespace Pulsar_DomeDriver.Driver
                         try
                         {
                             _guard.Dispose();
-                            SafeLog("SerialPortGuard disposed after failed ping.", LogLevel.Debug);
+                            _logger?.Log("SerialPortGuard disposed after failed ping.", LogLevel.Debug);
                         }
                         catch (Exception ex)
                         {
-                            SafeLog($"Error disposing SerialPortGuard: {ex.Message}", LogLevel.Error);
+                            _logger?.Log($"Error disposing SerialPortGuard: {ex.Message}", LogLevel.Error);
                         }
                         _guard = null;
                     }
-                    SafeLog("Driver disconnected.", LogLevel.Info);
+
+                    _logger?.Log("Driver disconnected.", LogLevel.Info);
                 }
             }
 
@@ -399,7 +360,7 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                SafeLog($"PingController failed: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"PingController failed: {ex.Message}", LogLevel.Error);
                 return false;
             }
         }
@@ -413,11 +374,11 @@ namespace Pulsar_DomeDriver.Driver
                     _port?.Close();
                     _guard?.Dispose();
                     _guard = null;
-                    SafeLog("Serial port forcibly closed.", LogLevel.Info);
+                    _logger?.Log("Serial port forcibly closed.", LogLevel.Info);
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"Forced port close failed: {ex.Message}", LogLevel.Error);
+                    _logger?.Log($"Forced port close failed: {ex.Message}", LogLevel.Error);
                 }
                 return true;
             }
@@ -434,40 +395,54 @@ namespace Pulsar_DomeDriver.Driver
                         _port.Close();
                         _guard?.Dispose();
                         _guard = null;
-                        SafeLog($"Serial port {_port.PortName} closed.", LogLevel.Info);
+                        _logger?.Log($"Serial port {_port.PortName} closed.", LogLevel.Info);
                     }
                     catch (Exception ex)
                     {
-                        SafeLog($"Error closing serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
+                        _logger?.Log($"Error closing serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
                     }
                 }
-                SafeLog("Driver disconnected.", LogLevel.Info);
+                _logger?.Log("Driver disconnected.");
                 return true;
             }
             catch (Exception ex)
             {
-                SafeLog($"DisconnectController failed: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"DisconnectController failed: {ex.Message}", LogLevel.Error);
                 return false;
             }
         }
 
+        private void HandleDriverFailure(Exception lastException,  string reason = "Unknown", int errorCount = 0)
+        {
+            _logger?.Log($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
+
+            _mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
+            _actionWatchdog?.MarkFailure();
+
+            _pollingActive = false;
+            Connected = false;
+
+            //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
+        }
+
         private void LogConnectionSnapshot()
         {
-            SafeLog("=== Dome Driver Connection Snapshot ===", LogLevel.Trace);
+            _logger?.Log("=== Dome Driver Connection Snapshot ===", LogLevel.Debug);
 
-            SafeLog($"PollingActive: {_pollingActive}", LogLevel.Trace);
-            SafeLog($"PollingTask status: {_pollingTask?.Status}", LogLevel.Trace);
-            SafeLog($"CommandInProgress: {_config.CommandInProgress}", LogLevel.Trace);
-            SafeLog($"Rebooting: {_rebooting}", LogLevel.Trace);
-            SafeLog($"ResetInProgress: {_config.Resetting}", LogLevel.Trace);
-            SafeLog($"LastPollTimestamp: {_lastPollTimestamp:HH:mm:ss.fff}", LogLevel.Trace);
-            SafeLog($"ShutterStatus: {_config.ShutterStatus}", LogLevel.Trace);
-            SafeLog($"DomeState: {_config.DomeState}", LogLevel.Trace);
-            SafeLog($"HomeStatus: {_config.HomeStatus}", LogLevel.Trace);
-            SafeLog($"ParkStatus: {_config.ParkStatus}", LogLevel.Trace);
-            SafeLog("=======================================", LogLevel.Trace);
+            _logger?.Log($"PollingActive: {_pollingActive}", LogLevel.Debug);
+            _logger?.Log($"PollingTask status: {_pollingTask?.Status}", LogLevel.Debug);
+            _logger?.Log($"CommandInProgress: {_commandInProgress}", LogLevel.Debug);
+            _logger?.Log($"Rebooting: {_rebooting}", LogLevel.Debug);
+            _logger?.Log($"ResetInProgress: {_config.Resetting}", LogLevel.Debug);
+            _logger?.Log($"LastPollTimestamp: {_lastPollTimestamp:HH:mm:ss.fff}", LogLevel.Debug);
+            _logger?.Log($"ShutterStatus: {_config.ShutterStatus}", LogLevel.Debug);
+            _logger?.Log($"DomeState: {_config.DomeState}", LogLevel.Debug);
+            _logger?.Log($"HomeStatus: {_config.HomeStatus}", LogLevel.Debug);
+            _logger?.Log($"ParkStatus: {_config.ParkStatus}", LogLevel.Debug);
+            _logger?.Log("=======================================", LogLevel.Debug);
 
         }
+
 
         #endregion
 
@@ -479,53 +454,42 @@ namespace Pulsar_DomeDriver.Driver
             {
                 if (milliseconds < 50 || milliseconds > 10000)
                 {
-                    SafeLog($"Polling interval {milliseconds} ms is out of bounds. Clamping to safe range.", LogLevel.Error);
+                    _logger?.Log($"Polling interval {milliseconds} ms is out of bounds. Clamping to safe range.", LogLevel.Error);
                     milliseconds = Math.Max(50, Math.Min(milliseconds, 10000));
                 }
                 _config.pollingIntervalMs = milliseconds;
             }
         }
 
-        private struct PollingStartupSnapshot
-        {
-            public bool CommandInProgress;
-            public bool Rebooting;
-            public int PollingIntervalMs;
-            public int ControllerTimeout;
-        }
-
         public void StartPolling()
         {
-            SafeLog("StartPolling() invoked — launching polling loop", LogLevel.Info);
-
-            PollingStartupSnapshot snapshot;
-
+            _logger?.Log("StartPolling() invoked — launching polling loop", LogLevel.Info);
             lock (_pollingLock)
             {
-                if (_config.CommandInProgress)
+                if (_commandInProgress)
                 {
-                    SafeLog("Polling start blocked: command in progress.", LogLevel.Debug);
+                    _logger?.Log("Polling start blocked: command in progress.", LogLevel.Debug);
                     return;
                 }
 
                 if (_pollingActive)
                 {
-                    SafeLog("Polling already active. Skipping restart.", LogLevel.Debug);
+                    _logger?.Log("Polling already active. Skipping restart.", LogLevel.Debug);
                     return;
                 }
 
                 if (_pollingTask != null)
                 {
-                    SafeLog($"Polling task status: {_pollingTask.Status}", LogLevel.Trace);
+                    _logger?.Log($"Polling task status: {_pollingTask.Status}", LogLevel.Debug);
 
                     if (_pollingTask.IsCompleted || _pollingTask.IsFaulted || _pollingTask.IsCanceled)
                     {
-                        SafeLog($"Polling task is stale (status: {_pollingTask.Status}). Resetting.", LogLevel.Debug);
+                        _logger?.Log($"Polling task is stale (status: {_pollingTask.Status}). Resetting.", LogLevel.Debug);
                         _pollingTask = null;
                     }
                 }
 
-                SafeLog($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
+                _logger?.Log($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
 
                 _pollingCancel?.Cancel();
                 _pollingCancel?.Dispose();
@@ -533,23 +497,16 @@ namespace Pulsar_DomeDriver.Driver
 
                 _lastPollTimestamp = DateTime.UtcNow;
 
-                // 🧠 Capture atomic snapshot of startup flags
-                snapshot = new PollingStartupSnapshot
-                {
-                    CommandInProgress = _config.CommandInProgress,
-                    Rebooting = _config.Rebooting,
-                    PollingIntervalMs = _config.pollingIntervalMs,
-                    ControllerTimeout = _config.controllerTimeout
-                };
-
                 try
                 {
-                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token, snapshot));
+                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token));
                     _pollingActive = true;
+                    //LogPollingStartupSnapshot();
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"Failed to start polling task: {ex.Message}", LogLevel.Error);
+                    _logger?.Log($"Failed to start polling task: {ex.Message}", LogLevel.Error);
+                    HandleDriverFailure(ex);
                     _pollingActive = false;
                 }
             }
@@ -559,9 +516,9 @@ namespace Pulsar_DomeDriver.Driver
         {
             lock (_pollingLock)
             {
-                if (_config.CommandInProgress)
+                if (_commandInProgress)
                 {
-                    SafeLog("Polling stop deferred: command in progress.", LogLevel.Debug);
+                    _logger?.Log("Polling stop deferred: command in progress.", LogLevel.Debug);
                     return false;
                 }
 
@@ -570,55 +527,66 @@ namespace Pulsar_DomeDriver.Driver
                 _pollingCancel?.Dispose();
                 _pollingCancel = null;
                 _pollingActive = false;
-                _config.CommandInProgress = false;
+                _commandInProgress = false;
                 //_config.Rebooting = false;
                 //_config.Resetting = false;
                 //***********************************************
                 _pollingTask = null;
 
-                SafeLog("Polling cancelled.", LogLevel.Debug);
+                _logger?.Log("Polling cancelled.", LogLevel.Debug);
                 return true;
             }
         }
 
-        private async Task PollLoopAsync(CancellationToken token, PollingStartupSnapshot startup)
+        private async Task PollLoopAsync(CancellationToken token)
         {
-            if (_disposed) return;
-
-            SafeLog("Polling loop heartbeat", LogLevel.Trace);
+            _logger?.Log("Polling loop heartbeat", LogLevel.Debug);
             int cycleCount = 0;
+            bool commandWasActive;
+            bool rebootWasActive;
+
             int startupWaitMs = 0;
+            while (true)
+            {
+                lock (_pollingLock)
+                {
+                    commandWasActive = _commandInProgress;
+                    rebootWasActive = _config.Rebooting;
+                }
+
+                _logger?.Log($"[PollLoop] commandWasActive={commandWasActive}, rebootWasActive={rebootWasActive}, elapsed={startupWaitMs} ms", LogLevel.Debug);
+
+                if (!commandWasActive && !rebootWasActive)
+                    break;
+
+                if (startupWaitMs == 0)
+                {
+                    _logger?.Log($"Polling delayed: command={commandWasActive}, reboot={rebootWasActive}. Waiting for readiness...", LogLevel.Debug);
+                }
+
+                await Task.Delay(_config.pollingIntervalMs, token);
+                startupWaitMs += _config.pollingIntervalMs;
+
+                if (startupWaitMs >= _config.controllerTimeout)
+                {
+                    _logger?.Log("Polling startup timed out after 10s waiting for readiness. Exiting.", LogLevel.Warning);
+                    return;
+                }
+            }
+
+            _logger?.Log("Polling loop started.", LogLevel.Debug);
+            int errorCount = 0;
 
             try
             {
-                // 🧠 Wait for readiness if command or reboot was active at launch
-                while (!_disposed && !token.IsCancellationRequested)
+                while (true)
                 {
-                    if (!startup.CommandInProgress && !startup.Rebooting)
+                    if (token.IsCancellationRequested)
+                    {
+                        _logger?.Log("Polling cancellation requested.", LogLevel.Debug);
                         break;
-
-                    if (startupWaitMs == 0)
-                    {
-                        SafeLog($"Polling delayed: command={startup.CommandInProgress}, reboot={startup.Rebooting}. Waiting for readiness...", LogLevel.Debug);
                     }
 
-                    await Task.Delay(startup.PollingIntervalMs, token);
-                    startupWaitMs += startup.PollingIntervalMs;
-
-                    if (startupWaitMs >= startup.ControllerTimeout)
-                    {
-                        SafeLog("Polling startup timed out after 10s waiting for readiness. Exiting.", LogLevel.Warning);
-                        return;
-                    }
-                }
-
-                if (_disposed || token.IsCancellationRequested) return;
-
-                SafeLog("Polling loop started.", LogLevel.Debug);
-                int errorCount = 0;
-
-                while (!_disposed && !token.IsCancellationRequested)
-                {
                     cycleCount++;
                     bool shouldPoll;
                     int interval;
@@ -637,7 +605,6 @@ namespace Pulsar_DomeDriver.Driver
                             SystemStatus(); // Safe outside lock
                             errorCount = 0;
 
-                            // 🧠 Watchdog success coordination
                             if (_lastIntent == DomeCommandIntent.GoHome && _config.HomeStatus)
                                 _actionWatchdog?.MarkSuccess();
                             if (_lastIntent == DomeCommandIntent.Park && _config.ParkStatus)
@@ -652,23 +619,23 @@ namespace Pulsar_DomeDriver.Driver
                                 _lastIntent = DomeCommandIntent.None;
                             }
 
-                            SafeLog($"Polling cycle at {DateTime.UtcNow:HH:mm:ss}, interval {interval} ms.", LogLevel.Trace);
+                            _logger?.Log($"Polling cycle at {DateTime.UtcNow:HH:mm:ss}, interval {interval} ms.", LogLevel.Debug);
                         }
                         catch (Exception ex)
                         {
                             errorCount++;
-                            SafeLog($"Polling error #{errorCount}: {ex.Message}", LogLevel.Debug);
+                            _logger?.Log($"Polling error #{errorCount}: {ex.Message}", LogLevel.Debug);
 
                             if (errorCount >= _config.pollingLoopRetries)
                             {
-                                SafeLog($"Polling error threshold reached ({_config.pollingLoopRetries}). Invoking PollingLoopFailure().", LogLevel.Warning);
-                                HandleDriverFailure(ex, errorCount);
+                                string reason = $"Polling error threshold reached ({_config.pollingLoopRetries}). Invoking PollingLoopFailure().";
+                                HandleDriverFailure(ex, reason,errorCount);
                                 break;
                             }
 
                             if (errorCount >= 3)
                             {
-                                SafeLog("Throttling polling due to repeated errors.", LogLevel.Debug);
+                                _logger?.Log("Throttling polling due to repeated errors.", LogLevel.Debug);
                                 await Task.Delay(interval, token);
                             }
                         }
@@ -680,153 +647,90 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     catch (TaskCanceledException)
                     {
-                        SafeLog("Polling delay cancelled.", LogLevel.Debug);
+                        _logger?.Log("Polling delay cancelled.", LogLevel.Debug);
                         break;
                     }
                     catch (Exception ex)
                     {
                         HandleDriverFailure(ex);
-                        SafeLog($"Polling delay error: {ex.Message}", LogLevel.Debug);
+                        _logger?.Log($"Polling delay error: {ex.Message}", LogLevel.Debug);
                     }
                 }
             }
             catch (Exception ex)
             {
-                if (!_disposed)
-                    SafeLog($"Polling thread terminated unexpectedly: {ex.Message}", LogLevel.Debug);
+                HandleDriverFailure(ex);
+                _logger?.Log($"Polling thread terminated unexpectedly: {ex.Message}", LogLevel.Debug);
             }
             finally
             {
-                SafeLog($"Polling thread exited cleanly. Last cancellation state: {token.IsCancellationRequested}, disposed={_disposed}", LogLevel.Debug);
+                _logger?.Log($"Polling thread exited cleanly. Last cancellation state: {token.IsCancellationRequested}", LogLevel.Debug);
             }
-        }
-
-        private void HandleDriverFailure(Exception lastException, int errorCount = 0, string reason = "Unknown")
-        {
-            //SafeLog($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
-            AlarmOn(reason);
-            //_mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
-            _actionWatchdog?.MarkFailure();
-
-            _pollingActive = false;
-            Connected = false;
-
-            //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
-        }
-
-        public void StartSystemMonitors()
-        {
-            StartAlarmMonitor();
-            StartWatchdog();
         }
 
         private void StartWatchdog()
         {
-            StartAlarmMonitor();
-            lock (_watchdogLock)
+            _systemWatchdogCts?.Cancel();
+            _systemWatchdogCts?.Dispose();
+            _systemWatchdogCts = new CancellationTokenSource();
+            var token = _systemWatchdogCts.Token;
+
+            _systemWatchdogTask = Task.Run(async () =>
             {
-                if (_disposed) return;
+                _logger?.Log("Polling watchdog started.", LogLevel.Debug);
 
-                try
+                while (!token.IsCancellationRequested)
                 {
-                    _systemWatchdogCts?.Cancel();
-                    _systemWatchdogCts?.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    SafeLog($"Error disposing previous watchdog CTS: {ex.Message}", LogLevel.Warning);
-                }
-
-                _systemWatchdogCts = new CancellationTokenSource();
-                var token = _systemWatchdogCts.Token;
-
-                _systemWatchdogTask = Task.Run(async () =>
-                {
-                    lock (_watchdogLock)
-                    {
-                        if (_disposed) return;
-                    }
-
-                    try { SafeLog("Polling watchdog started.", LogLevel.Debug); } catch { }
-
-                    _config.WatchdogRunning = true;
-
                     try
                     {
-                        while (true)
+                        await Task.Delay(_systemWatchdogInterval, token);
+
+                        // 🧠 MQTT heartbeat
+                        if (_mqttPublisher?.IsConnected == true)
                         {
-                            lock (_watchdogLock)
-                            {
-                                if (_disposed || token.IsCancellationRequested)
-                                    break;
-                            }
+                            string utcTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
+                            string heartbeat = $"Alive at {utcTime}";
+                            TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
+                            //await _mqttPublisher.PublishAsync("dome/status", domeOutputStatus);
+                            //_logger?.Log($"[Watchdog] Heartbeat published: {heartbeat}", LogLevel.Debug);
+                        }
+                        else
+                        {
+                            _logger?.Log("[Watchdog] MQTT not connected — heartbeat skipped", LogLevel.Warning);
+                        }
 
-                            try
-                            {
-                                await Task.Delay(_systemWatchdogInterval, token);
+                        // 🧠 Polling stall detection
+                        var elapsed = DateTime.UtcNow - _lastPollTimestamp;
+                        if (elapsed > _pollingStallThreshold)
+                        {
+                            _logger?.Log($"Polling watchdog triggered — last poll was {elapsed.TotalSeconds:F1}s ago. Restarting polling.", LogLevel.Debug);
 
-                                // 🧠 MQTT heartbeat
-                                if (_mqttPublisher?.IsConnected == true)
-                                {
-                                    string utcTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
-                                    string heartbeat = $"Alive at {utcTime}";
-                                    TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
-                                    AlarmHeartbeat();
-                                    _lastWatchdogPing = DateTime.UtcNow;
-                                }
-                                else
-                                {
-                                    SafeLog("[Watchdog] MQTT not connected — heartbeat skipped", LogLevel.Warning);
-                                }
-
-                                // 🧠 Polling stall detection
-                                var elapsed = DateTime.UtcNow - _lastPollTimestamp;
-                                if (elapsed > _pollingStallThreshold)
-                                {
-                                    SafeLog($"Polling watchdog triggered — last poll was {elapsed.TotalSeconds:F1}s ago. Restarting polling.", LogLevel.Debug);
-
-                                    StopPolling();
-                                    Thread.Sleep(50); // brief pause to ensure clean stop
-                                    StartPolling();
-                                }
-                            }
-                            catch (TaskCanceledException)
-                            {
-                                lock (_watchdogLock)
-                                {
-                                    if (!_disposed)
-                                        SafeLog("Polling watchdog cancelled.", LogLevel.Debug);
-                                }
-                                break;
-                            }
-                            catch (Exception ex)
-                            {
-                                lock (_watchdogLock)
-                                {
-                                    if (!_disposed)
-                                        SafeLog($"Polling watchdog error: {ex.Message}", LogLevel.Error);
-                                }
-                            }
+                            StopPolling();
+                            Thread.Sleep(50); // brief pause to ensure clean stop
+                            StartPolling();
                         }
                     }
-                    finally
+                    catch (TaskCanceledException)
                     {
-                        _config.WatchdogRunning = false;
-                        lock (_watchdogLock)
-                        {
-                            if (!_disposed)
-                                SafeLog("Polling watchdog exited.", LogLevel.Debug);
-                        }
+                        _logger?.Log("Polling watchdog cancelled.", LogLevel.Debug);
+                        break;
                     }
-                }, token);
-            }
+                    catch (Exception ex)
+                    {
+                        string reason = $"Polling watchdog error.";
+                        HandleDriverFailure(ex, reason);
+                    }
+                }
+
+                _logger?.Log("Polling watchdog exited.", LogLevel.Debug);
+            }, token);
         }
 
         private void StopWatchdog()
         {
             if (_systemWatchdogCts != null)
             {
-                SafeLog("Stopping polling watchdog.", LogLevel.Debug);
+                _logger?.Log("Stopping polling watchdog.", LogLevel.Debug);
 
                 try
                 {
@@ -834,108 +738,14 @@ namespace Pulsar_DomeDriver.Driver
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"Error cancelling watchdog: {ex.Message}", LogLevel.Error);
+                    string reason = $"Error cancelling watchdog.";
+                    HandleDriverFailure(ex, reason);
                 }
                 _systemWatchdogCts.Dispose();
                 _systemWatchdogCts = null;
             }
             _systemWatchdogTask = null;
         }
-
-        private void StartAlarmMonitor()
-        {
-            lock (_alarmTimerLock)
-            {
-                _alarmTimerCts?.Cancel();
-                _alarmTimerCts = new CancellationTokenSource();
-                var token = _alarmTimerCts.Token;
-
-                _alarmTimerTask = Task.Run(async () =>
-                {
-                    try
-                    {
-                        while (!token.IsCancellationRequested)
-                        {
-                            await Task.Delay(5000, token); // check every 5s
-
-                            var elapsed = DateTime.UtcNow - _lastWatchdogPing;
-                            if (elapsed > _alarmTimeout)
-                            {
-                                AlarmOn("Watchdog failed to reset alarm timer — possible hang or stall.");
-                                return;
-                            }
-                        }
-                    }
-                    catch (TaskCanceledException) { }
-                    catch (Exception ex)
-                    {
-                        SafeLog($"Alarm monitor error: {ex.Message}", LogLevel.Warning);
-                    }
-                }, token);
-            }
-        }
-
-        private void StopAlarmMonitor()
-        {
-            lock (_alarmTimerLock)
-            {
-                _alarmTimerCts?.Cancel();
-                _alarmTimerCts?.Dispose();
-                _alarmTimerCts = null;
-                _alarmTimerTask = null;
-            }
-        }
-
-        private void ResetAlarmMonitor()
-        {
-            lock (_alarmTimerLock)
-            {
-                SafeLog("Resetting Alarm Monitor alarm", LogLevel.Info);
-                _alarmTriggered = false;
-                StopAlarmMonitor();
-                TryMQTTPublish(_mqttAlarm, "Not set");
-                TryMQTTPublish(_mqttAlarmMessage, "");
-            }
-        }
-
-        public void AlarmOn(string message = null)
-        {
-            lock (_alarmLock)
-            {
-                if (_alarmTriggered)
-                {
-                    // Already triggered — do nothing
-                    return;
-                }
-
-                _alarmTriggered = true;
-
-                TryMQTTPublish(_mqttAlarm, "on");
-                SafeLog("Alarm triggered: status 'on' published", LogLevel.Warning);
-
-                if (!string.IsNullOrWhiteSpace(message))
-                {
-                    TryMQTTPublish(_mqttAlarmMessage, message);
-                    SafeLog($"Alarm message published: {message}", LogLevel.Warning);
-                }
-            }
-        }
-
-        public void AlarmHeartbeat()
-        {
-            lock (_alarmLock)
-            {
-                if (_alarmTriggered)
-                {
-                    TryMQTTPublish(_mqttAlarm, "on");
-                }
-                else
-                {
-                    TryMQTTPublish(_mqttAlarm, "off");
-                }
-            }
-        }
-
 
         #endregion
 
@@ -963,10 +773,10 @@ namespace Pulsar_DomeDriver.Driver
 
                     if (!allOk)
                     {
-                        SafeLog("[DomeStatus] Status check failed", LogLevel.Warning);
-                        if (!domeOk) SafeLog("Dome status malformed", LogLevel.Debug);
-                        if (!homeOk) SafeLog("Home status malformed", LogLevel.Debug);
-                        if (!parkOk) SafeLog("Park status malformed", LogLevel.Debug);
+                        _logger?.Log("[DomeStatus] Status check failed", LogLevel.Warning);
+                        if (!domeOk) _logger?.Log("Dome status malformed", LogLevel.Debug);
+                        if (!homeOk) _logger?.Log("Home status malformed", LogLevel.Debug);
+                        if (!parkOk) _logger?.Log("Park status malformed", LogLevel.Debug);
                     }
 
                     return allOk;
@@ -975,16 +785,17 @@ namespace Pulsar_DomeDriver.Driver
 
                 CompleteSystemStatus();
             }
-            catch (TimeoutException)
+            catch (TimeoutException ex)
             {
-                SafeLog("[DomeStatus] Status check failed after retries — raising alarm", LogLevel.Error);
+                string reason = $"Dome status failed after retries.";
+                HandleDriverFailure(ex, reason);
                 _GNS.SendGNS(GNSType.Alarm, "Dome status failed after retries");
             }
         }
 
         public void CompleteSystemStatus()
         {
-            SafeLog($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
+            _logger?.Log($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
 
             try
             {
@@ -1038,7 +849,7 @@ namespace Pulsar_DomeDriver.Driver
                 {
                     if (_config.ForceBusy)
                     {
-                        SafeLog($"ForceBusy overridden: command {_lastIntent} appears complete based on status.", LogLevel.Debug);
+                        _logger?.Log($"ForceBusy overridden: command {_lastIntent} appears complete based on status.", LogLevel.Debug);
                         _config.ForceBusy = false;
                     }
 
@@ -1069,7 +880,8 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                SafeLog($"DomeStatus error: {ex.Message}", LogLevel.Debug);
+                string reason = $"DomeStatus error.";
+                HandleDriverFailure(ex, reason);
             }
         }
 
@@ -1079,7 +891,7 @@ namespace Pulsar_DomeDriver.Driver
 
             if (string.IsNullOrWhiteSpace(raw))
             {
-                SafeLog("Empty or null dome response.", LogLevel.Error);
+                _logger?.Log("Empty or null dome response.", LogLevel.Error);
                 return false;
             }
 
@@ -1095,7 +907,7 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }
 
-            SafeLog($"Dome response had {lines.Length} lines. No valid status line found. Raw: '{raw}'", LogLevel.Debug);
+            _logger?.Log($"Dome response had {lines.Length} lines. No valid status line found. Raw: '{raw}'", LogLevel.Debug);
             return false;
         }
 
@@ -1103,7 +915,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             if (tokens.Length < 13)
             {
-                SafeLog($"Insufficient token count: expected 13, got {tokens.Length}", LogLevel.Debug);
+                _logger?.Log($"Insufficient token count: expected 13, got {tokens.Length}", LogLevel.Debug);
                 return false;
             }
 
@@ -1122,7 +934,7 @@ namespace Pulsar_DomeDriver.Driver
                     throw new ArgumentOutOfRangeException("TargetAzimuth", targetAzimuth, "Must be between -179 and 539");
 
                 double normalizedTarget = (targetAzimuth % 360 + 360) % 360;
-                SafeLog($"Target azimuth: raw={targetAzimuth}, normalized={normalizedTarget}", LogLevel.Trace);
+                _logger?.Log($"Target azimuth: raw={targetAzimuth}, normalized={normalizedTarget}", LogLevel.Debug);
 
                 if (!int.TryParse(tokens[4], out int motorDir) || motorDir < 0 || motorDir > 2)
                     throw new ArgumentOutOfRangeException("MotorDir", motorDir, "Must be 0, 1, or 2");
@@ -1170,7 +982,7 @@ namespace Pulsar_DomeDriver.Driver
             }
             catch (Exception ex)
             {
-                SafeLog($"Error parsing dome status: {ex.Message}", LogLevel.Debug);
+                _logger?.Log($"Error parsing dome status: {ex.Message}", LogLevel.Debug);
                 return false;
             }
         }
@@ -1181,7 +993,7 @@ namespace Pulsar_DomeDriver.Driver
 
             if (string.IsNullOrWhiteSpace(raw))
             {
-                SafeLog("Empty HOME response.", LogLevel.Debug);
+                _logger?.Log("Empty HOME response.", LogLevel.Debug);
                 return false;
             }
 
@@ -1202,7 +1014,7 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }
 
-            SafeLog($"Unexpected HOME response: '{raw}'", LogLevel.Debug);
+            _logger?.Log($"Unexpected HOME response: '{raw}'", LogLevel.Debug);
             return false;
         }
 
@@ -1212,7 +1024,7 @@ namespace Pulsar_DomeDriver.Driver
 
             if (string.IsNullOrWhiteSpace(raw))
             {
-                SafeLog("Empty PARK response.", LogLevel.Debug);
+                _logger?.Log("Empty PARK response.", LogLevel.Debug);
                 return false;
             }
 
@@ -1233,27 +1045,20 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }
 
-            SafeLog($"Unexpected PARK response: '{raw}'", LogLevel.Debug);
+            _logger?.Log($"Unexpected PARK response: '{raw}'", LogLevel.Debug);
             return false;
         }
 
         public void SlewingStatus()
         {
-            bool forceBusy = _config.ForceBusy;
-
-            if (forceBusy)
+            // Slewing status
+            if (_config.ForceBusy)
             {
                 _config.SlewingStatus = true;
             }
             else
             {
-                bool isStationary;
-
-                lock (_pollingLock)
-                {
-                    isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
-                }
-
+                bool isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
                 _config.SlewingStatus = !isStationary;
             }
         }
@@ -1276,20 +1081,19 @@ namespace Pulsar_DomeDriver.Driver
         {
             if (domeActivity != oldDomeActivity && domeActivity != "")
             {
-                SafeLog($"Dome is: \t{domeActivity}", LogLevel.Info);
+                _logger?.Log($"Dome is: \t{domeActivity}", LogLevel.Info);
                 oldDomeActivity = domeActivity;
             }
 
             if (shutterActivity != oldShutterActivity && shutterActivity != "")
             {
-                SafeLog($"Shutter is: \t{shutterActivity}", LogLevel.Info);
+                _logger?.Log($"Shutter is: \t{shutterActivity}", LogLevel.Info);
                 oldShutterActivity = shutterActivity;
             }
         }
 
         public class RetryPolicy
         {
-            public Action<string, LogLevel>? Log { get; set; }
             public int MaxAttempts { get; set; } = 3;
             public int DelayMs { get; set; } = 100;
             public bool ExponentialBackoff { get; set; } = false;
@@ -1312,16 +1116,8 @@ namespace Pulsar_DomeDriver.Driver
             {
                 for (int attempt = 0; attempt < MaxAttempts; attempt++)
                 {
-                    Log?.Invoke($"RetryPolicy attempt {attempt}", LogLevel.Debug);
-                    try
-                    {
-                        var result = action();
-                        if (isSuccess(result)) return result;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log?.Invoke($"RetryPolicy caught exception: {ex.Message}", LogLevel.Warning);
-                    }
+                    var result = action();
+                    if (isSuccess(result)) return result;
 
                     int delay = ExponentialBackoff ? DelayMs * (1 << attempt) : DelayMs;
                     Thread.Sleep(delay);
@@ -1333,61 +1129,52 @@ namespace Pulsar_DomeDriver.Driver
 
         #endregion
 
-        #region Safe Calls
-
-        private void SafeLog(string message, LogLevel level)
-        {
-            if (_disposed) return;
-            try { _logger?.Log(message, level); }
-            catch { /* suppress logging errors during disposal */ }
-        }
-
-        #endregion
-
         #region Reset
 
         public async Task ResetRoutineAsync(string reset = "full")
         {
-            lock (_resetLock)
-            {
-                if (_config.Resetting)
-                {
-                    SafeLog("Reset already in progress — skipping duplicate trigger.", LogLevel.Warning);
-                    return;
-                }
-
-                _config.Resetting = true;
-            }
-
-            CancelCurrentActionWatchdog();
-
             TryMQTTPublish("Dome/Debug", "in reset");
+
+            if (_config.Resetting)
+            {
+                _logger?.Log("Reset already in progress — skipping duplicate trigger.", LogLevel.Warning);
+                return;
+            }
 
             try
             {
-                SafeLog("Requesting watchdog cancellation...", LogLevel.Warning);
-                _systemWatchdogCts?.Cancel();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
-                var timeout = Task.Delay(5000);
-                while (_config.WatchdogRunning && !timeout.IsCompleted)
+                while (_config.WatchdogRunning)
                 {
-                    SafeLog("Waiting for watchdog to exit...", LogLevel.Trace);
-                    await Task.Delay(200);
-                }
+                    if (cts.Token.IsCancellationRequested)
+                    {
+                        _logger?.Log("Watchdog stuck — forcing cleanup", LogLevel.Error);
+                        CancelCurrentActionWatchdog();
+                        _actionWatchdog?.Stop();
+                        _actionWatchdog = null;
+                        _config.WatchdogRunning = false;
+                        break;
+                    }
 
-                if (_config.WatchdogRunning)
-                {
-                    SafeLog("Watchdog did not exit after cancellation — aborting reset.", LogLevel.Error);
-                    _GNS.SendGNS(GNSType.Alarm, "Reset aborted: watchdog failed to exit after cancellation.");
-                    lock (_resetLock) { _config.Resetting = false; }
-                    return;
+                    _logger?.Log("Waiting for existing watchdog to release...", LogLevel.Debug);
+                    await Task.Delay(500, cts.Token);
                 }
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
             {
-                SafeLog($"Unexpected error while waiting for watchdog: {ex.Message}", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, "Reset aborted due to watchdog coordination error.");
-                lock (_resetLock) { _config.Resetting = false; }
+                // Expected if delay is canceled mid-loop
+                _logger?.Log("Watchdog wait canceled — forcing cleanup", LogLevel.Warning);
+                CancelCurrentActionWatchdog();
+                _actionWatchdog?.Stop();
+                _actionWatchdog = null;
+                _config.WatchdogRunning = false;
+            }
+
+            if (_config.WatchdogRunning)
+            {
+                _logger?.Log("Watchdog still running after forced stop — aborting reset.", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, "Reset aborted: watchdog failed to stop");
                 return;
             }
 
@@ -1396,9 +1183,11 @@ namespace Pulsar_DomeDriver.Driver
 
             StopPolling();
             _config.ControllerReady = false;
+            _config.Resetting = true;
 
-            SafeLog("Triggering ResetRoutine due to command error or stall.", LogLevel.Info);
-            _GNS.SendGNS(GNSType.Message, "Triggering ResetRoutine due to command error or stall.");
+            string initialMessage = "Triggering ResetRoutine due to command error or stall.";
+            _logger?.Log(initialMessage, LogLevel.Info);
+            _GNS.SendGNS(GNSType.Message, initialMessage);
 
             lock (_pollingLock)
             {
@@ -1409,7 +1198,7 @@ namespace Pulsar_DomeDriver.Driver
             {
                 if ((_config.SoftReset || softOnly) && !_config.SoftResetAttempted)
                 {
-                    SafeLog("Performing soft reset.", LogLevel.Warning);
+                    _logger?.Log("Performing soft reset.", LogLevel.Warning);
                     _config.SoftResetAttempted = true;
                     _config.SoftResetSuccess = false;
                     _config.HardResetAttempted = false;
@@ -1419,16 +1208,11 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         _config.SoftResetSuccess = await HardwareReset("soft");
 
-                        bool proceed;
-                        lock (_resetLock)
+                        if (_config.SoftResetSuccess && !_config.Rebooting)
                         {
-                            proceed = _config.SoftResetSuccess && !_config.Rebooting;
-                        }
-
-                        if (proceed)
-                        {
-                            SafeLog("Soft reset completed successfully.", LogLevel.Info);
-                            _GNS.SendGNS(GNSType.Message, "Soft reset completed successfully.");
+                            string message = "Soft reset completed successfully.";
+                            _logger?.Log(message, LogLevel.Info);
+                            _GNS.SendGNS(GNSType.Message, message);
 
                             lock (_pollingLock)
                             {
@@ -1437,24 +1221,24 @@ namespace Pulsar_DomeDriver.Driver
                             }
 
                             StartPolling();
-                            Thread.Sleep(_config.serialSettle);
+                            Thread.Sleep(_config.serialSettle); // settle time for serial
                             await Task.Delay(_config.serialSettle * 4);
 
                             _ = Task.Run(ReplayLastCommand);
                             return;
                         }
 
-                        SafeLog("Soft reset failed or rebooting still active.", LogLevel.Info);
+                        _logger?.Log("Soft reset failed or rebooting still active.", LogLevel.Info);
                     }
                     catch (Exception ex)
                     {
-                        SafeLog($"Soft reset failed: {ex.Message}", LogLevel.Error);
+                        _logger?.Log($"Soft reset failed: {ex.Message}", LogLevel.Error);
                     }
                 }
 
                 if ((_config.HardReset || hardOnly) && !_config.HardResetAttempted)
                 {
-                    SafeLog("Performing hard hardware reset.", LogLevel.Warning);
+                    _logger?.Log("Performing hard hardware reset.", LogLevel.Warning);
                     _config.HardResetAttempted = true;
                     _config.HardResetSuccess = false;
 
@@ -1462,16 +1246,11 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         _config.HardResetSuccess = await HardwareReset("hard");
 
-                        bool proceed;
-                        lock (_resetLock)
+                        if (_config.HardResetSuccess && !_config.Rebooting)
                         {
-                            proceed = _config.HardResetSuccess && !_config.Rebooting;
-                        }
-
-                        if (proceed)
-                        {
-                            SafeLog("Hard reset completed successfully.", LogLevel.Info);
-                            _GNS.SendGNS(GNSType.Message, "Hard reset completed successfully.");
+                            string message = "Hard reset completed successfully.";
+                            _logger?.Log(message, LogLevel.Info);
+                            _GNS.SendGNS(GNSType.Message, message);
 
                             StartPolling();
                             Thread.Sleep(60);
@@ -1479,35 +1258,32 @@ namespace Pulsar_DomeDriver.Driver
                             return;
                         }
 
-                        SafeLog("Hard reset failed or rebooting still active.", LogLevel.Info);
+                        _logger?.Log("Hard reset failed or rebooting still active.", LogLevel.Info);
                     }
                     catch (Exception ex)
                     {
-                        SafeLog($"Hard reset failed: {ex.Message}", LogLevel.Error);
+                        _logger?.Log($"Hard reset failed: {ex.Message}", LogLevel.Error);
                     }
                 }
 
                 if (_config.HardResetAttempted && !_config.HardResetSuccess)
                 {
                     string failMessage = $"Unrecoverable failure after hard reset for {_lastIntent}";
-                    SafeLog(failMessage, LogLevel.Error);
+                    _logger?.Log(failMessage, LogLevel.Error);
                     _GNS.SendGNS(GNSType.Alarm, failMessage);
                     TryMQTTPublish(_mqttAlarm, failMessage);
                 }
             }
             catch (Exception ex)
             {
-                string exMessage = $"ResetRoutine encountered unexpected error: {ex.Message}";
-                SafeLog(exMessage, LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, exMessage);
-                TryMQTTPublish(_mqttAlarm, exMessage);
+                string reason = $"ResetRoutine error.";
+                HandleDriverFailure(ex, reason);
+                _GNS.SendGNS(GNSType.Alarm, reason);
+                TryMQTTPublish(_mqttAlarm, reason);
             }
             finally
             {
-                lock (_resetLock)
-                {
-                    _config.Resetting = false;
-                }
+                _config.Resetting = false;
             }
         }
 
@@ -1515,10 +1291,10 @@ namespace Pulsar_DomeDriver.Driver
         {
             try
             {
-                SafeLog($"{type} reset initiated.", LogLevel.Warning);
+                _logger?.Log($"{type} reset initiated.", LogLevel.Warning);
                 _GNS.SendGNS(GNSType.Stop, $"{type} reset initiated.");
 
-                lock (_resetLock)
+                lock (_pollingLock)
                 {
                     _config.Rebooting = true;
                 }
@@ -1533,25 +1309,22 @@ namespace Pulsar_DomeDriver.Driver
                     _ => false
                 };
 
-                lock (_resetLock)
-                {
-                    _config.Rebooting = false;
-                }
+                _config.Rebooting = false;
 
                 if (success)
                 {
-                    SafeLog($"{type} Reset completed successfully.", LogLevel.Info);
+                    _logger?.Log($"{type} Reset completed successfully.", LogLevel.Info);
                 }
                 else
                 {
-                    SafeLog($"{type} Reset failed.", LogLevel.Warning);
+                    _logger?.Log($"{type} Reset failed.", LogLevel.Warning);
                 }
 
                 return success;
             }
             catch (Exception ex)
             {
-                SafeLog($"{type} Reset error: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"{type} Reset error: {ex.Message}", LogLevel.Error);
                 return false;
             }
         }
@@ -1562,7 +1335,7 @@ namespace Pulsar_DomeDriver.Driver
             _config.HardResetAttempted = false;
 
             SendAndVerify("RESTART", ResponseMode.Blind);
-            SafeLog("RESTART command sent (blind). Checking for reboot via shutter status...", LogLevel.Info);
+            _logger?.Log("RESTART command sent (blind). Checking for reboot via shutter status...", LogLevel.Info);
 
             await Task.Delay(_config.pollingIntervalMs * 2);
             SystemStatus();
@@ -1570,19 +1343,19 @@ namespace Pulsar_DomeDriver.Driver
 
             if (initialStatus >= 0 && initialStatus <= 3)
             {
-                SafeLog($"Soft reset likely ignored — shutter status is {initialStatus}.", LogLevel.Debug);
+                _logger?.Log($"Soft reset likely ignored — shutter status is {initialStatus}.", LogLevel.Debug);
                 return false;
             }
             else if (initialStatus == 6)
             {
-                SafeLog("Shutter status is 6 — reboot likely in progress. Waiting for recovery...", LogLevel.Error);
+                _logger?.Log("Shutter status is 6 — reboot likely in progress. Waiting for recovery...", LogLevel.Error);
                 bool ready = await WaitForShutterReady();
                 return ready;
             }
             else
             {
                 // general failure
-                SafeLog("Shutter status has thrown an error", LogLevel.Error);
+                _logger?.Log("Shutter status has thrown an error", LogLevel.Error);
                 return false;
             }
         }
@@ -1598,35 +1371,35 @@ namespace Pulsar_DomeDriver.Driver
             if (!await ResetDisconnection("hard")) return false;
             if (!LaunchResetProcess(exePath, offParams, "OFF")) return false;
 
-            SafeLog($"Waiting {_config.CycleDelay}ms for controller to cycle...", LogLevel.Info);
+            _logger?.Log($"Waiting {_config.CycleDelay}ms for controller to cycle...", LogLevel.Info);
             await Task.Delay(_config.CycleDelay);
 
             if (!LaunchResetProcess(exePath, onParams, "ON")) return false;
 
-            SafeLog($"Waiting {_config.ResetDelay}ms for controller to come online...", LogLevel.Info);
+            _logger?.Log($"Waiting {_config.ResetDelay}ms for controller to come online...", LogLevel.Info);
             await Task.Delay(_config.ResetDelay);
 
-            SafeLog($"Hard Reset: attempting reconnection after reset...", LogLevel.Info);
+            _logger?.Log($"Hard Reset: attempting reconnection after reset...", LogLevel.Info);
 
             bool connected = ConnectController();
-            SafeLog($"Hard Reset: ConnectController returned {connected} after reset.", LogLevel.Debug);
+            _logger?.Log($"Hard Reset: ConnectController returned {connected} after reset.", LogLevel.Debug);
 
             if (!connected)
             {
-                SafeLog($"Hard Reset: failed to connect to controller.", LogLevel.Error);
+                _logger?.Log($"Hard Reset: failed to connect to controller.", LogLevel.Error);
                 return false;
             }
 
             bool baseConnected = PingController(); // sync call
-            SafeLog($"Hard Reset: PingController returned {baseConnected}.", LogLevel.Debug);
+            _logger?.Log($"Hard Reset: PingController returned {baseConnected}.", LogLevel.Debug);
 
             if (!baseConnected)
             {
-                SafeLog($"Hard Reset: base controller did not respond.", LogLevel.Error);
+                _logger?.Log($"Hard Reset: base controller did not respond.", LogLevel.Error);
                 return false;
             }
 
-            SafeLog($"Hard Reset: base controller responded. Checking shutter status...", LogLevel.Info);
+            _logger?.Log($"Hard Reset: base controller responded. Checking shutter status...", LogLevel.Info);
 
             bool successfulReboot = await WaitForShutterReady();
 
@@ -1646,7 +1419,7 @@ namespace Pulsar_DomeDriver.Driver
 
                 if (status >= 0 && status <= 3)
                 {
-                    SafeLog($"Shutter ready (status={status}). Waiting {_config.shutterSettle / 1000}s before continuing...", LogLevel.Info);
+                    _logger?.Log($"Shutter ready (status={status}). Waiting {_config.shutterSettle / 1000}s before continuing...", LogLevel.Info);
                     await Task.Delay(_config.shutterSettle);
                     return true;
                 }
@@ -1655,7 +1428,7 @@ namespace Pulsar_DomeDriver.Driver
                 elapsed += pollInterval;
             }
 
-            SafeLog("Shutter did not become ready within timeout window.", LogLevel.Warning);
+            _logger?.Log("Shutter did not become ready within timeout window.", LogLevel.Warning);
             return false;
         }
 
@@ -1668,13 +1441,13 @@ namespace Pulsar_DomeDriver.Driver
             {
                 if (DisconnectController(true))
                 {
-                    SafeLog($"Device disconnected for {type} reset.", LogLevel.Info);
+                    _logger?.Log($"Device disconnected for {type} reset.", LogLevel.Info);
                     return true;
                 }
-                SafeLog($"Attempt {attempt} failed. Retrying in {retryDelayMs}ms...", LogLevel.Error);
+                _logger?.Log($"Attempt {attempt} failed. Retrying in {retryDelayMs}ms...", LogLevel.Error);
                 await Task.Delay(retryDelayMs);
             }
-            SafeLog($"Device disconnection failed during {type} reset.", LogLevel.Error);
+            _logger?.Log($"Device disconnection failed during {type} reset.", LogLevel.Error);
             return false;
         }
 
@@ -1682,11 +1455,11 @@ namespace Pulsar_DomeDriver.Driver
         {
             if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
             {
-                SafeLog($"Reset executable not found: '{exePath}'", LogLevel.Error);
+                _logger?.Log($"Reset executable not found: '{exePath}'", LogLevel.Error);
                 return false;
             }
 
-            SafeLog($"Launching external reset [{label}]: {exePath} {parameters}", LogLevel.Warning);
+            _logger?.Log($"Launching external reset [{label}]: {exePath} {parameters}", LogLevel.Warning);
 
             try
             {
@@ -1702,7 +1475,7 @@ namespace Pulsar_DomeDriver.Driver
                 {
                     if (process == null)
                     {
-                        SafeLog($"Failed to start external reset process [{label}].", LogLevel.Error);
+                        _logger?.Log($"Failed to start external reset process [{label}].", LogLevel.Error);
                         return false;
                     }
 
@@ -1711,19 +1484,19 @@ namespace Pulsar_DomeDriver.Driver
                     int exitCode = process.ExitCode;
                     if (exitCode == 0)
                     {
-                        SafeLog($"External reset process [{label}] completed successfully (exit code 0).", LogLevel.Info);
+                        _logger?.Log($"External reset process [{label}] completed successfully (exit code 0).", LogLevel.Info);
                         return true;
                     }
                     else
                     {
-                        SafeLog($"External reset process [{label}] exited with error code {exitCode}.", LogLevel.Error);
+                        _logger?.Log($"External reset process [{label}] exited with error code {exitCode}.", LogLevel.Error);
                         return false;
                     }
                 }
             }
             catch (Exception ex)
             {
-                SafeLog($"Error running external reset [{label}]: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"Error running external reset [{label}]: {ex.Message}", LogLevel.Error);
                 return false;
             }
         }
@@ -1731,7 +1504,7 @@ namespace Pulsar_DomeDriver.Driver
         private void ReplayLastCommand()
         {
 
-            SafeLog($"Replaying last intent after reset: {_lastIntent}", LogLevel.Info);
+            _logger?.Log($"Replaying last intent after reset: {_lastIntent}", LogLevel.Info);
 
             if (_lastIntent == DomeCommandIntent.None)
                 return;
@@ -1755,13 +1528,13 @@ namespace Pulsar_DomeDriver.Driver
                         SlewToAzimuth(_config.SlewAz);
                         break;
                     default:
-                        SafeLog($"No replay logic defined for intent: {_lastIntent}", LogLevel.Error);
+                        _logger?.Log($"No replay logic defined for intent: {_lastIntent}", LogLevel.Error);
                         break;
                 }
             }
             catch (Exception ex)
             {
-                SafeLog($"Replay of intent {_lastIntent} failed: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"Replay of intent {_lastIntent} failed: {ex.Message}", LogLevel.Error);
             }
         }
 
@@ -1781,37 +1554,35 @@ namespace Pulsar_DomeDriver.Driver
 
         public async Task StartMQTTAsync()
         {
-            SafeLog("StartMQTTAsync entered", LogLevel.Debug);
+            _logger?.Log("StartMQTTAsync entered", LogLevel.Debug);
 
             try
             {
+                // Create MQTT publisher
                 _mqttPublisher = new MqttPublisher(_logger, _config);
-                SafeLog("MqttPublisher instance created", LogLevel.Debug);
+                _logger?.Log("MqttPublisher instance created", LogLevel.Debug);
 
-                SafeLog("Initializing MQTT connection...", LogLevel.Debug);
-                await _mqttPublisher.InitializeAsync(_config.MQTTip, _config.MQTTport);
+                // Connect to broker
+                _logger?.Log("Initializing MQTT connection...", LogLevel.Debug);
+                await _mqttPublisher.InitializeAsync("10.17.1.92");
+                _logger?.Log("MQTT connection established", LogLevel.Info);
 
-                await _mqttPublisher.WaitForConnectedAsync(); // ✅ Add this line
-
-                SafeLog("MQTT connection confirmed", LogLevel.Info);
-
+                // Publish startup message
                 string startupMessage = "Pulsar Ascom driver connected";
-                SafeLog($"Publishing startup message: '{startupMessage}'", LogLevel.Debug);
+                _logger?.Log($"Publishing startup message: '{startupMessage}'", LogLevel.Debug);
                 TryMQTTPublish(_mqttStatus, startupMessage);
-                SafeLog("Startup message published", LogLevel.Debug);
+                _logger?.Log("Startup message published", LogLevel.Debug);
             }
             catch (Exception ex)
             {
-                SafeLog($"StartDriverAsync failed: {ex}", LogLevel.Error);
+                _logger?.Log($"StartDriverAsync failed: {ex}", LogLevel.Error);
             }
         }
+
         // Null-safe, non-blocking MQTT publish
         private void TryMQTTPublish(string topic, string message)
         {
-            lock (_mqttLock)
-            {
-                if (_config.Rebooting) return;
-            }
+            if (_config.Rebooting) return;
 
             if (_mqttPublisher != null && _mqttPublisher.IsConnected && !string.IsNullOrWhiteSpace(topic))
             {
@@ -1825,7 +1596,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public string CommandString(string command, bool raw)
         {
-            SafeLog($"CommandString: {command}, raw={raw}", LogLevel.Debug);
+            _logger?.Log($"CommandString: {command}, raw={raw}", LogLevel.Debug);
             return "OK";
         }
 
@@ -1833,17 +1604,17 @@ namespace Pulsar_DomeDriver.Driver
         {
             if (string.IsNullOrWhiteSpace(command))
             {
-                SafeLog("SendCommand called with empty or null command.", LogLevel.Error);
+                _logger?.Log("SendCommand called with empty or null command.", LogLevel.Error);
                 throw new ArgumentException("Command cannot be null or empty.");
             }
 
             if (_guard == null || !_guard.IsReady)
             {
-                SafeLog("SerialPortGuard not ready — aborting send.", LogLevel.Error);
+                _logger?.Log("SerialPortGuard not ready — aborting send.", LogLevel.Error);
                 throw new ASCOM.NotConnectedException("Serial port is not ready.");
             }
 
-            SafeLog($"Dispatching command: {command} (ExpectResponse={expectResponse})", LogLevel.Trace);
+            _logger?.Log($"Dispatching command: {command} (ExpectResponse={expectResponse})", LogLevel.Debug);
 
             return _guard.Send(command, expectResponse);
         }
@@ -1858,21 +1629,16 @@ namespace Pulsar_DomeDriver.Driver
             {
                 MaxAttempts = _config.sendVerifyMaxRetries,
                 DelayMs = 100,
-                Log = SafeLog
-                //ExponentialBackoff = false
+                ExponentialBackoff = false
             };
 
             string response = "";
             bool expectResponse = mode != ResponseMode.Blind;
-            int repeatLoop = 0;
 
             return retryPolicy.Execute(() =>
             {
                 response = SendCommand(command, expectResponse);
-                SafeLog($"Loop count - {repeatLoop}", LogLevel.Debug);
-                SafeLog($"Sent - {command} \t got - {response}", LogLevel.Debug);
-
-                repeatLoop++;
+                _logger?.Log($"Sent - {command} \t got - {response}", LogLevel.Debug);
 
                 if (mode == ResponseMode.Blind)
                 {
@@ -1886,18 +1652,18 @@ namespace Pulsar_DomeDriver.Driver
 
                 if ((mode == ResponseMode.MatchExact || mode == ResponseMode.MatchAny) && expectedResponses == null)
                 {
-                    SafeLog($"Expected responses not provided for mode {mode}.", LogLevel.Error);
+                    _logger?.Log($"Expected responses not provided for mode {mode}.", LogLevel.Error);
                     return new ResponseResult { Response = response, IsMatch = false, Command = command };
                 }
 
                 if (mode == ResponseMode.MatchExact && expectedResponses?.Count() == 1)
                 {
                     string expected = expectedResponses.First();
-                    SafeLog($"Expected response was {expected}", LogLevel.Debug);
+                    _logger?.Log($"Expected response was {expected}", LogLevel.Debug);
 
                     if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                     {
-                        SafeLog("MatchExact succeeded — returning early", LogLevel.Debug);
+                        _logger?.Log("MatchExact succeeded — returning early", LogLevel.Debug);
                         return new ResponseResult { Response = response, IsMatch = true, Command = command };
                     }
                 }
@@ -1908,7 +1674,7 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                         {
-                            SafeLog($"Matched one of expected responses: {response}", LogLevel.Debug);
+                            _logger?.Log($"Matched one of expected responses: {response}", LogLevel.Debug);
                             return new ResponseResult { Response = response, IsMatch = true, Command = command };
                         }
                     }
@@ -1933,6 +1699,8 @@ namespace Pulsar_DomeDriver.Driver
         }
 
         #region Dispose / Shutdown
+
+        private bool _disposed;
 
         ~DomeDriver()
         {
@@ -1961,7 +1729,6 @@ namespace Pulsar_DomeDriver.Driver
             SafeDispose(() => StopPolling(), "StopPolling");
             SafeDispose(() => StopWatchdog(), "StopWatchdog");
             SafeDispose(() => DisconnectMqttSafely(), "DisconnectMqttSafely");
-            SafeDispose(() => StopAlarmMonitor(), "Stopping Watchdog alarm");
 
             SafeDispose(() =>
             {
@@ -2007,7 +1774,8 @@ namespace Pulsar_DomeDriver.Driver
                     _pollingCancel = null;
                 }, "PollingCancel");
 
-                SafeDispose(() => SafeLog("Driver disposed.", LogLevel.Info), "Logger.Log");
+                SafeDispose(() => _logger?.Log("Driver disposed.", LogLevel.Info), "Logger.Log");
+
                 SafeDispose(() => _logger?.Dispose(), "Logger.Dispose");
             }
 
@@ -2015,7 +1783,7 @@ namespace Pulsar_DomeDriver.Driver
             {
                 try
                 {
-                    SafeLog($"Disposal warnings: {string.Join("; ", failures)}", LogLevel.Warning);
+                    _logger?.Log($"Disposal warnings: {string.Join("; ", failures)}", LogLevel.Warning);
                 }
                 catch { /* Don't let logging failure block disposal */ }
             }
@@ -2068,7 +1836,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             get
             {
-                SafeLog("Altitude was called but not supported", LogLevel.Debug);
+                _logger?.Log("Altitude was called but not supported", LogLevel.Debug);
                 throw new MethodNotImplementedException("Altitude not supported");
             }
         }
@@ -2125,7 +1893,7 @@ namespace Pulsar_DomeDriver.Driver
             get => false;
             set
             {
-                SafeLog("Slave was called but not supported", LogLevel.Debug);
+                _logger?.Log("Slave was called but not supported", LogLevel.Debug);
                 throw new MethodNotImplementedException("Slaved not supported");
             }
         }
@@ -2187,7 +1955,7 @@ double? gnsTimeoutFactor = null)
             }
             catch (Exception ex)
             {
-                SafeLog($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
             }
             finally
             {
@@ -2219,7 +1987,7 @@ double? gnsTimeoutFactor = null)
         {
             if (alreadyAtTarget())
             {
-                SafeLog("Already at target — skipping command and watchdog.", LogLevel.Info);
+                _logger?.Log("Already at target — skipping command and watchdog.", LogLevel.Info);
                 _config.ForceBusy = false;
                 StartPolling();
                 return false;
@@ -2227,7 +1995,7 @@ double? gnsTimeoutFactor = null)
 
             if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
             {
-                SafeLog($"{actionLabel} command failed: No match response.", LogLevel.Error);
+                _logger?.Log($"{actionLabel} command failed: No match response.", LogLevel.Error);
                 RaiseAlarmAndReset($"{actionLabel} command failed (no ACK).");
                 return false;
             }
@@ -2237,20 +2005,20 @@ double? gnsTimeoutFactor = null)
 
         private bool WaitForControllerReady(string actionLabel)
         {
-            SafeLog($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
-            SafeLog($"[WaitForControllerReady] Entered at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
+            _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
+            _logger?.Log($"[WaitForControllerReady] Entered at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
             int waitMs = 0;
             while (!_config.ControllerReady && waitMs < _config.controllerTimeout)
             {
-                SafeLog($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Trace);
+                _logger?.Log($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Debug);
                 Thread.Sleep(_config.pollingIntervalMs);
                 waitMs += _config.pollingIntervalMs;
             }
 
             if (!_config.ControllerReady)
             {
-                SafeLog($"[WaitForControllerReady] Timeout reached — ControllerReady still false", LogLevel.Warning);
-                SafeLog("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
+                _logger?.Log($"[WaitForControllerReady] Timeout reached — ControllerReady still false", LogLevel.Warning);
+                _logger?.Log("Controller not ready after wait — watchdog launch aborted.", LogLevel.Warning);
                 RaiseAlarmAndReset($"Controller not ready after {actionLabel}; initiating recovery.");
                 return false;
             }
@@ -2298,7 +2066,7 @@ double? gnsTimeoutFactor = null)
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"Watchdog error ({action}): {ex.Message}", LogLevel.Error);
+                    _logger?.Log($"Watchdog error ({action}): {ex.Message}", LogLevel.Error);
                 }
                 finally
                 {
@@ -2320,7 +2088,7 @@ double? gnsTimeoutFactor = null)
         {
             _GNS.SendGNS(GNSType.Alarm, alarmMessage);
             TryMQTTPublish(_mqttAlarm, alarmMessage);
-            SafeLog($"[ALARM] {alarmMessage}", LogLevel.Error);
+            _logger?.Log($"[ALARM] {alarmMessage}", LogLevel.Error);
             _config.ForceBusy = true;
             _ = Task.Run(async () => await ResetRoutineAsync());
         }
@@ -2500,18 +2268,12 @@ double? gnsTimeoutFactor = null)
 
         public void AbortSlew()
         {
-            if (_disposed) return;
-
             LogDomeStatus("Aborting all movement...", "Aborting all movement...");
 
-            // Ensure abort is not allowed during reset or reboot
-            lock (_actionLock)
+            if (_config.Resetting || _config.Rebooting)
             {
-                if (_config.Resetting || _config.Rebooting)
-                {
-                    SafeLog("Abort ignored: reset/reboot in progress.", LogLevel.Warning);
-                    return;
-                }
+                _logger?.Log("Abort ignored: reset/reboot in progress.", LogLevel.Warning);
+                return;
             }
 
             StopPolling();
@@ -2529,6 +2291,7 @@ double? gnsTimeoutFactor = null)
                         _config.SlewingStatus = false; // let poller confirm DomeState
                     }
 
+                    // Cancel any active watchdog
                     CancelCurrentActionWatchdog();
 
                     _config.WatchdogRunning = false;
@@ -2539,44 +2302,20 @@ double? gnsTimeoutFactor = null)
                 }
                 else
                 {
-                    SafeLog("Abort STOP failed (no ACK). Initiating recovery.", LogLevel.Error);
+                    _logger?.Log("Abort STOP failed (no ACK). Initiating recovery.", LogLevel.Error);
                     _GNS.SendGNS(GNSType.Alarm, "Abort failed (no ACK). Resetting controller.");
                     TryMQTTPublish(_mqttAlarm, "Alarm");
-
-                    _config.ForceBusy = true;
-
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await ResetRoutineAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            SafeLog($"ResetRoutineAsync failed during abort recovery: {ex.Message}", LogLevel.Error);
-                        }
-                    });
+                    _config.ForceBusy = true; // keep client seeing activity
+                    _ = Task.Run(async () => await ResetRoutineAsync());
                 }
             }
             catch (Exception ex)
             {
-                SafeLog($"Abort command error: {ex.Message}", LogLevel.Error);
+                _logger?.Log($"Abort command error: {ex.Message}", LogLevel.Error);
                 _GNS.SendGNS(GNSType.Alarm, "Abort threw an exception. Resetting controller.");
                 TryMQTTPublish(_mqttAlarm, "Alarm");
-
                 _config.ForceBusy = true;
-
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await ResetRoutineAsync();
-                    }
-                    catch (Exception innerEx)
-                    {
-                        SafeLog($"ResetRoutineAsync failed during abort exception recovery: {innerEx.Message}", LogLevel.Error);
-                    }
-                });
+                _ = Task.Run(async () => await ResetRoutineAsync());
             }
             finally
             {
@@ -2586,26 +2325,26 @@ double? gnsTimeoutFactor = null)
 
         public void SyncToAzimuth(double azimuth)
         {
-            SafeLog($"SyncToAzimuth called with altitude = {azimuth} — not supported.", LogLevel.Debug);
+            _logger?.Log($"SyncToAzimuth called with altitude = {azimuth} — not supported.", LogLevel.Debug);
             throw new ASCOM.MethodNotImplementedException("SyncToAzimuth is not supported by this dome.");
 
         }
 
         public void Unpark()
         {
-            SafeLog("Unpark called.", LogLevel.Debug);
+            _logger?.Log("Unpark called.", LogLevel.Debug);
             throw new ASCOM.MethodNotImplementedException("Unpark is not supported by this dome.");
         }
 
         public void SetPark()
         {
-            SafeLog("SetPark called.", LogLevel.Debug);
+            _logger?.Log("SetPark called.", LogLevel.Debug);
             // Add logic to define current position as park position
         }
 
         public void SlewToAltitude(double altitude)
         {
-            SafeLog($"SlewToAltitude {altitude} called — not supported.", LogLevel.Debug);
+            _logger?.Log($"SlewToAltitude {altitude} called — not supported.", LogLevel.Debug);
             throw new ASCOM.MethodNotImplementedException("SlewToAltitude is not supported by this dome.");
         }
 
@@ -2628,7 +2367,6 @@ double? gnsTimeoutFactor = null)
 
         // Convenience wrappers to keep status logs consistent
         private void LogDome(string message) => LogDomeStatus(message, "");
-
         private void LogShutter(string message) => LogDomeStatus("", message);
 
         #endregion
@@ -2706,7 +2444,7 @@ double? gnsTimeoutFactor = null)
 };
         public string Action(string actionName, string actionParameters = "")
         {
-            SafeLog($"Action called: {actionName} with parameters: {actionParameters}", LogLevel.Info);
+            _logger?.Log($"Action called: {actionName} with parameters: {actionParameters}", LogLevel.Info);
 
             if (actionName == "Full Reset")
             {

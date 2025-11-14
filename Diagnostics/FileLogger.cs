@@ -1,4 +1,5 @@
 ﻿using Pulsar_DomeDriver.Config;
+using Pulsar_DomeDriver.MQTT;
 using System;
 using System.IO;
 using static Pulsar_DomeDriver.Config.ConfigManager;
@@ -8,16 +9,21 @@ namespace Pulsar_DomeDriver.Diagnostics
     public class FileLogger : IDisposable
     {
         private readonly string _logFilePath;
+        private readonly LogLevel _logLevel;
         private readonly bool _debugLog;
         private readonly bool _traceLog;
         private readonly StreamWriter _writer;
         private readonly object _writeLock = new();
-        private volatile bool _disposed = false;
-        private readonly object _disposeLock = new();
+        //private readonly MqttPublisher _mqttPublisher;
 
-        public FileLogger(string logFilePath, bool debugEnabled = false, bool traceEnabled = false)
+        public FileLogger(
+            string logFilePath,
+            bool debugEnabled = false,
+            bool traceEnabled = false
+            /*MqttPublisher mqttPublisher = null*/)
         {
-            _logFilePath = logFilePath ?? throw new ArgumentNullException(nameof(logFilePath));
+            _logFilePath = logFilePath;
+            //_logLevel = logLevel;
             _debugLog = debugEnabled;
             _traceLog = traceEnabled;
 
@@ -42,8 +48,13 @@ namespace Pulsar_DomeDriver.Diagnostics
 
         public void Log(string message, LogLevel level = LogLevel.None)
         {
-            if (_disposed) return;
-            if (!_traceLog && !_debugLog) return;
+            //if (level > _logLevel) return;
+            if (!_traceLog && !_debugLog)
+            {
+                return;
+            }
+            //if (level == LogLevel.Debug && !_debugLog) return;
+            //if (level == LogLevel.Trace && !_traceLog) return;
 
             string label = level switch
             {
@@ -55,47 +66,40 @@ namespace Pulsar_DomeDriver.Diagnostics
                 _ => "[LOG]"
             };
 
-            label = label.PadRight(12);
+            label = label.PadRight(12); // ensures label is always x characters wide
+
             WriteLine(label, message, level);
         }
 
         private void WriteLine(string levelLabel, string message, LogLevel level = LogLevel.None)
         {
-            if (_disposed) return;
-
             string cleanedMessage = message.Replace("\r", "").Replace("\t", " - ").TrimEnd();
-            string timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
 
-            if (level == LogLevel.Trace && !_traceLog) return;
-            if (level == LogLevel.Debug && !_debugLog) return;
+            var timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            //var threadId = Environment.CurrentManagedThreadId;
 
-            lock (_writeLock)
+            if (level == LogLevel.Trace && _traceLog)
             {
-                if (_disposed) return;
-                _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
+                lock (_writeLock)
+                {
+                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
+                    return;
+                }
             }
+            else if (_debugLog)
+            {
+                lock (_writeLock)
+                {
+                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
+                }
+            }
+
         }
 
         public void Dispose()
         {
-            lock (_disposeLock)
-            {
-                if (_disposed) return;
-                _disposed = true;
-
-                try
-                {
-                    lock (_writeLock)
-                    {
-                        _writer?.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}] \t[INFO]     Logger disposed.");
-                        _writer?.Dispose();
-                    }
-                }
-                catch
-                {
-                    // Swallow any disposal-time exceptions silently
-                }
-            }
+            Log("Logger disposed.", LogLevel.Info);
+            _writer?.Dispose();
         }
     }
 }
