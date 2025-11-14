@@ -1,5 +1,4 @@
 ﻿using Pulsar_DomeDriver.Config;
-using Pulsar_DomeDriver.MQTT;
 using System;
 using System.IO;
 using static Pulsar_DomeDriver.Config.ConfigManager;
@@ -9,21 +8,16 @@ namespace Pulsar_DomeDriver.Diagnostics
     public class FileLogger : IDisposable
     {
         private readonly string _logFilePath;
-        private readonly LogLevel _logLevel;
         private readonly bool _debugLog;
         private readonly bool _traceLog;
         private readonly StreamWriter _writer;
         private readonly object _writeLock = new();
-        //private readonly MqttPublisher _mqttPublisher;
+        private volatile bool _disposed = false;
+        private readonly object _disposeLock = new();
 
-        public FileLogger(
-            string logFilePath,
-            bool debugEnabled = false,
-            bool traceEnabled = false
-            /*MqttPublisher mqttPublisher = null*/)
+        public FileLogger(string logFilePath, bool debugEnabled = false, bool traceEnabled = false)
         {
-            _logFilePath = logFilePath;
-            //_logLevel = logLevel;
+            _logFilePath = logFilePath ?? throw new ArgumentNullException(nameof(logFilePath));
             _debugLog = debugEnabled;
             _traceLog = traceEnabled;
 
@@ -48,13 +42,8 @@ namespace Pulsar_DomeDriver.Diagnostics
 
         public void Log(string message, LogLevel level = LogLevel.None)
         {
-            //if (level > _logLevel) return;
-            if (!_traceLog && !_debugLog)
-            {
-                return;
-            }
-            //if (level == LogLevel.Debug && !_debugLog) return;
-            //if (level == LogLevel.Trace && !_traceLog) return;
+            if (_disposed) return;
+            if (!_traceLog && !_debugLog) return;
 
             string label = level switch
             {
@@ -66,40 +55,47 @@ namespace Pulsar_DomeDriver.Diagnostics
                 _ => "[LOG]"
             };
 
-            label = label.PadRight(12); // ensures label is always x characters wide
-
+            label = label.PadRight(12);
             WriteLine(label, message, level);
         }
 
         private void WriteLine(string levelLabel, string message, LogLevel level = LogLevel.None)
         {
+            if (_disposed) return;
+
             string cleanedMessage = message.Replace("\r", "").Replace("\t", " - ").TrimEnd();
+            string timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
 
-            var timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
-            //var threadId = Environment.CurrentManagedThreadId;
+            if (level == LogLevel.Trace && !_traceLog) return;
+            if (level == LogLevel.Debug && !_debugLog) return;
 
-            if (level == LogLevel.Trace && _traceLog)
+            lock (_writeLock)
             {
-                lock (_writeLock)
-                {
-                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
-                    return;
-                }
+                if (_disposed) return;
+                _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
             }
-            else if (_debugLog)
-            {
-                lock (_writeLock)
-                {
-                    _writer.WriteLine($"[{timestamp}] \t{levelLabel} {cleanedMessage}");
-                }
-            }
-
         }
 
         public void Dispose()
         {
-            Log("Logger disposed.", LogLevel.Info);
-            _writer?.Dispose();
+            lock (_disposeLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                try
+                {
+                    lock (_writeLock)
+                    {
+                        _writer?.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}] \t[INFO]     Logger disposed.");
+                        _writer?.Dispose();
+                    }
+                }
+                catch
+                {
+                    // Swallow any disposal-time exceptions silently
+                }
+            }
         }
     }
 }
