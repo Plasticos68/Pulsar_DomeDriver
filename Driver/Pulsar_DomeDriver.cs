@@ -893,7 +893,7 @@ namespace Pulsar_DomeDriver.Driver
                 SafeLog("Resetting Alarm Monitor alarm", LogLevel.Info);
                 _alarmTriggered = false;
                 StopAlarmMonitor();
-                TryMQTTPublish(_mqttAlarm, "Not set");
+                TryMQTTPublish(_mqttAlarm, "Off");
                 TryMQTTPublish(_mqttAlarmMessage, "");
             }
         }
@@ -910,8 +910,8 @@ namespace Pulsar_DomeDriver.Driver
 
                 _alarmTriggered = true;
 
-                TryMQTTPublish(_mqttAlarm, "on");
-                SafeLog("Alarm triggered: status 'on' published", LogLevel.Warning);
+                TryMQTTPublish(_mqttAlarm, "On");
+                SafeLog("Alarm triggered: status 'On' published", LogLevel.Warning);
 
                 if (!string.IsNullOrWhiteSpace(message))
                 {
@@ -927,11 +927,11 @@ namespace Pulsar_DomeDriver.Driver
             {
                 if (_alarmTriggered)
                 {
-                    TryMQTTPublish(_mqttAlarm, "on");
+                    TryMQTTPublish(_mqttAlarm, "On");
                 }
                 else
                 {
-                    TryMQTTPublish(_mqttAlarm, "off");
+                    TryMQTTPublish(_mqttAlarm, "Off");
                 }
             }
         }
@@ -1806,17 +1806,49 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
         // Null-safe, non-blocking MQTT publish
+        //private void TryMQTTPublish(string topic, string message)
+        //{
+        //    lock (_mqttLock)
+        //    {
+        //        if (_config.Rebooting) return;
+        //    }
+
+        //    if (_mqttPublisher != null && _mqttPublisher.IsConnected && !string.IsNullOrWhiteSpace(topic))
+        //    {
+        //        _ = _mqttPublisher.PublishAsync(topic, message);
+        //    }
+        //}
+
         private void TryMQTTPublish(string topic, string message)
         {
             lock (_mqttLock)
             {
-                if (_config.Rebooting) return;
+                if (_config.Rebooting)
+                {
+                    SafeLog($"[TryMQTTPublish] Skipped - Rebooting is true", LogLevel.Debug);
+                    return;
+                }
             }
 
-            if (_mqttPublisher != null && _mqttPublisher.IsConnected && !string.IsNullOrWhiteSpace(topic))
+            if (_mqttPublisher == null)
             {
-                _ = _mqttPublisher.PublishAsync(topic, message);
+                SafeLog($"[TryMQTTPublish] Skipped - publisher is null", LogLevel.Debug);
+                return;
             }
+
+            if (!_mqttPublisher.IsConnected)
+            {
+                SafeLog($"[TryMQTTPublish] Skipped - not connected", LogLevel.Debug);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(topic))
+            {
+                SafeLog($"[TryMQTTPublish] Skipped - topic is empty", LogLevel.Debug);
+                return;
+            }
+
+            _ = _mqttPublisher.PublishAsync(topic, message);
         }
 
         #endregion
