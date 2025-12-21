@@ -69,7 +69,7 @@ namespace Pulsar_DomeDriver.Helper
 
         public async Task Start()
         {
-            _config.WatchdogRunning = true;
+            _config.ActionWatchdogRunning = true;
             await AnnounceStartAsync();
             await PublishAsync(_mqttTopic, $"{_longAction}");
 
@@ -143,7 +143,7 @@ namespace Pulsar_DomeDriver.Helper
             }
             finally
             {
-                _config.WatchdogRunning = false;
+                _config.ActionWatchdogRunning = false;
                 _config.ForceBusy = false; // ensure it's always cleared
                 Stop();
             }

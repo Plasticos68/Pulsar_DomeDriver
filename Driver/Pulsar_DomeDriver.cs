@@ -35,6 +35,8 @@ namespace Pulsar_DomeDriver.Driver
         private ConfigManager _config;
         private SerialPort _port;
         private SerialPortGuard? _guard;
+        private EventHandler? _processExitHandler;
+        private EventHandler? _domainUnloadHandler;
 
         // connection
         private bool _connected = false;
@@ -46,12 +48,14 @@ namespace Pulsar_DomeDriver.Driver
         private readonly object _mqttLock = new();
         private readonly object _actionLock = new();
         private readonly object _watchdogLock = new object();
+        private readonly object _connectionLock = new();
 
         //polling thread for serial comms
         private CancellationTokenSource _pollingCancel = null;
         private bool _pollingActive = false;
         private readonly object _pollingLock = new();
         private Task _pollingTask = null;
+        private volatile bool _manualDisconnect = false;
 
         // Timestamp updated by polling loop
         private DateTime _lastPollTimestamp = DateTime.MinValue;
@@ -154,11 +158,11 @@ namespace Pulsar_DomeDriver.Driver
                 // Resolve debug flag
                 string debugRaw = _profile.GetValue(driverId, "DebugLog", "");
                 bool debugLog = string.Equals(debugRaw, "true", StringComparison.OrdinalIgnoreCase);
-                SafeLog($"Registry DebugLog = '{debugRaw}' → parsed as {debugLog}", LogLevel.Debug);
+                SafeLog($"Registry DebugLog = '{debugRaw}' ? parsed as {debugLog}", LogLevel.Debug);
 
                 string traceRaw = _profile.GetValue(driverId, "TraceLog", "");
                 bool traceLog = string.Equals(traceRaw, "true", StringComparison.OrdinalIgnoreCase);
-                SafeLog($"Registry TraceLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
+                SafeLog($"Registry TraceLog = '{traceRaw}' ? parsed as {traceLog}", LogLevel.Debug);
 
                 // Initialize logger, config and GNS
                 _logger = new FileLogger(logPath, debugLog, traceLog);
@@ -170,8 +174,10 @@ namespace Pulsar_DomeDriver.Driver
 
                 // Proceed with driver setup
                 InitializeSerialPort();
-                AppDomain.CurrentDomain.ProcessExit += (_, __) => Dispose();
-                AppDomain.CurrentDomain.DomainUnload += (_, __) => Dispose();
+                _processExitHandler = (_, __) => Dispose();
+                _domainUnloadHandler = (_, __) => Dispose();
+                AppDomain.CurrentDomain.ProcessExit += _processExitHandler;
+                AppDomain.CurrentDomain.DomainUnload += _domainUnloadHandler;
 
                 // Send startup GNS message
                 _GNS.SendGNS(GNSType.Message, "Dome driver initialized successfully");
@@ -248,16 +254,24 @@ namespace Pulsar_DomeDriver.Driver
             get => _connected;
             set
             {
-                lock (_pollingLock)
+                lock (_connectionLock)
                 {
-                    if (value && _connected)
-                    {
-                        SafeLog("Already connected. Skipping reinitialization.", LogLevel.Debug);
-                        return;
-                    }
-
                     if (value)
                     {
+                        bool alreadyConnected;
+                        lock (_pollingLock)
+                        {
+                            alreadyConnected = _connected;
+                        }
+
+                        if (alreadyConnected)
+                        {
+                            SafeLog("Already connected. Skipping reinitialization.", LogLevel.Debug);
+                            return;
+                        }
+
+                        _manualDisconnect = false;
+
                         bool success = ConnectController();
 
                         if (!success)
@@ -265,19 +279,29 @@ namespace Pulsar_DomeDriver.Driver
 
                         if (_config.UseMQTT)
                         {
+                            bool mqttReady = false;
                             try
                             {
                                 //StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
-                                Task.Run(async () => await StartMQTTAsync()).Wait();
+                                mqttReady = Task.Run(async () => await StartMQTTAsync()).GetAwaiter().GetResult();
                                 //TryMQTTPublish(_mqttStatus, "Driver connected");
-                                ResetAlarmMonitor();
-                                StartSystemMonitors();
                             }
                             catch (Exception ex)
                             {
                                 SafeLog($"MQTT startup failed: {ex.Message}", LogLevel.Error);
-                                throw new ASCOM.NotConnectedException("MQTT startup failed.");
+                                mqttReady = false;
                             }
+
+                            if (mqttReady)
+                            {
+                                ResetAlarmMonitor();
+                            }
+                            else
+                            {
+                                SafeLog("MQTT unavailable - watchdog/alarm disabled.", LogLevel.Warning);
+                            }
+
+                            StartSystemMonitors(startWatchdog: mqttReady);
                         }
 
                         lock (_pollingLock)
@@ -291,61 +315,85 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     else
                     {
-                        bool pollingStopped = StopPolling();
-                        StopWatchdog();
-                        if (pollingStopped)
-                        {
-                            Task pollingWaitTask = null;
-                            if (pollingStopped && _pollingTask != null)
-                            {
-                                pollingWaitTask = _pollingTask;
-                            }
-
-                            // Release lock before waiting
-                            lock (_pollingLock)
-                            {
-                                _connected = false;
-                            }
-
-                            if (pollingWaitTask != null)
-                            {
-                                if (!pollingWaitTask.Wait(3000)) // timeout in ms
-                                {
-                                    SafeLog("Polling task did not complete within timeout — continuing disconnect.", LogLevel.Warning);
-                                }
-                                else
-                                {
-                                    SafeLog("Polling task stopped successfully.", LogLevel.Debug);
-                                }
-
-                                Thread.Sleep(_config.serialSettle); // Optional settle delay
-                            }
-                            SafeLog("Polling task stopped successfully.", LogLevel.Debug);
-                        }
-                        if (_mqttPublisher != null && _mqttPublisher.IsConnected)
-                        {
-                            Task.Run(async () => await _mqttPublisher.PublishAsync(_mqttStatus, "Driver disconnected"));
-                            Task.Run(async () => await _mqttPublisher.DisconnectAsync());
-                            SafeLog("MQTT disconnected", LogLevel.Info);
-                        }
-
-
-
-                        lock (_pollingLock)
-                        {
-                            _connected = false;
-                        }
-                        SafeLog("Disconnect initiated.", LogLevel.Info);
-                        var start = DateTime.UtcNow;
-
-                        DisconnectController();
-
-                        var elapsed = DateTime.UtcNow - start;
-                        SafeLog($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
-                        _GNS.SendGNS(GNSType.Message, "Dome driver disconnected");
+                        DisconnectInternal(manual: true);
                     }
                 }
             }
+        }
+
+        private void DisconnectInternal(bool manual)
+        {
+            if (manual)
+            {
+                _manualDisconnect = true;
+                StopAutoReconnect();
+                StopAlarmMonitor();
+            }
+
+            StopWatchdog();
+
+            Task pollingWaitTask;
+            lock (_pollingLock)
+            {
+                pollingWaitTask = _pollingTask;
+            }
+
+            bool pollingStopped = StopPolling(force: true);
+
+            if (pollingStopped && pollingWaitTask != null)
+            {
+                if (!pollingWaitTask.Wait(3000)) // timeout in ms
+                {
+                    SafeLog("Polling task did not complete within timeout - continuing disconnect.", LogLevel.Warning);
+                }
+                else
+                {
+                    SafeLog("Polling task stopped successfully.", LogLevel.Debug);
+                }
+
+                Thread.Sleep(_config.serialSettle); // Optional settle delay
+            }
+
+            if (_mqttPublisher != null)
+            {
+                var publisher = _mqttPublisher;
+                _mqttPublisher = null;
+
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (publisher.IsConnected)
+                        {
+                            await publisher.PublishAsync(_mqttStatus, "Driver disconnected");
+                            await publisher.DisconnectAsync();
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    finally
+                    {
+                        try { publisher.Dispose(); } catch { }
+                    }
+                });
+
+                SafeLog("MQTT disconnected", LogLevel.Info);
+            }
+
+            lock (_pollingLock)
+            {
+                _connected = false;
+            }
+
+            SafeLog("Disconnect initiated.", LogLevel.Info);
+            var start = DateTime.UtcNow;
+
+            DisconnectController();
+
+            var elapsed = DateTime.UtcNow - start;
+            SafeLog($"Disconnect completed in {elapsed.TotalMilliseconds} ms.", LogLevel.Info);
+            _GNS.SendGNS(GNSType.Message, "Dome driver disconnected");
         }
 
         public bool ConnectController()
@@ -599,7 +647,7 @@ namespace Pulsar_DomeDriver.Driver
 
                 _lastPollTimestamp = DateTime.UtcNow;
 
-                // 🧠 Capture atomic snapshot of startup flags
+                // ?? Capture atomic snapshot of startup flags
                 snapshot = new PollingStartupSnapshot
                 {
                     CommandInProgress = _config.CommandInProgress,
@@ -623,9 +671,14 @@ namespace Pulsar_DomeDriver.Driver
 
         public bool StopPolling()
         {
+            return StopPolling(force: false);
+        }
+
+        private bool StopPolling(bool force)
+        {
             lock (_pollingLock)
             {
-                if (_config.CommandInProgress)
+                if (_config.CommandInProgress && !force)
                 {
                     SafeLog("Polling stop deferred: command in progress.", LogLevel.Debug);
                     return false;
@@ -657,7 +710,7 @@ namespace Pulsar_DomeDriver.Driver
 
             try
             {
-                // 🧠 Wait for readiness if command or reboot was active at launch
+                // ?? Wait for readiness if command or reboot was active at launch
                 while (!_disposed && !token.IsCancellationRequested)
                 {
                     if (!startup.CommandInProgress && !startup.Rebooting)
@@ -703,7 +756,7 @@ namespace Pulsar_DomeDriver.Driver
                             SystemStatus(); // Safe outside lock
                             errorCount = 0;
 
-                            // 🧠 Watchdog success coordination
+                            // ?? Watchdog success coordination
                             if (_lastIntent == DomeCommandIntent.GoHome && _config.HomeStatus)
                                 _actionWatchdog?.MarkSuccess();
                             if (_lastIntent == DomeCommandIntent.Park && _config.ParkStatus)
@@ -775,15 +828,20 @@ namespace Pulsar_DomeDriver.Driver
             _actionWatchdog?.MarkFailure();
 
             _pollingActive = false;
-            Connected = false;
+            lock (_connectionLock)
+            {
+                DisconnectInternal(manual: false);
+            }
 
             //OnDriverDisconnected?.Invoke(this, EventArgs.Empty);
         }
 
-        public void StartSystemMonitors()
+        public void StartSystemMonitors(bool startWatchdog = true)
         {
-            StartAlarmMonitor();
-            StartWatchdog();
+            if (startWatchdog)
+            {
+                StartWatchdog();
+            }
             StartAutoReconnect();
         }
 
@@ -816,7 +874,7 @@ namespace Pulsar_DomeDriver.Driver
 
                     try { SafeLog("Polling watchdog started.", LogLevel.Debug); } catch { }
 
-                    _config.WatchdogRunning = true;
+                    _config.SystemWatchdogRunning = true;
 
                     try
                     {
@@ -831,29 +889,28 @@ namespace Pulsar_DomeDriver.Driver
                             try
                             {
                                 await Task.Delay(_systemWatchdogInterval, token);
-
-                                // 🧠 MQTT heartbeat
+                                _lastWatchdogPing = DateTime.UtcNow;
+                                // ?? MQTT heartbeat
                                 if (_mqttPublisher?.IsConnected == true)
                                 {
                                     string utcTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
                                     string heartbeat = $"Alive at {utcTime}";
                                     TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
-                                    AlarmHeartbeat();
-                                    _lastWatchdogPing = DateTime.UtcNow;
+                                    AlarmHeartbeat();
                                 }
                                 else
                                 {
                                     SafeLog("[Watchdog] MQTT not connected — heartbeat skipped", LogLevel.Warning);
                                 }
 
-                                // 🧠 GNS heartbeat every 5 minutes (300 seconds)
+                                // ?? GNS heartbeat every 5 minutes (300 seconds)
                                 if ((DateTime.UtcNow - _lastGNSHeartbeat).TotalSeconds >= 300)
                                 {
                                     _GNS.SendGNS(GNSType.Message, $"Dome driver heartbeat: Azimuth {_config.Azimuth:F1}°, Shutter {_config.ShutterStatus}, Connected {_connected}");
                                     _lastGNSHeartbeat = DateTime.UtcNow;
                                 }
 
-                                // 🧠 Polling stall detection
+                                // ?? Polling stall detection
                                 var elapsed = DateTime.UtcNow - _lastPollTimestamp;
                                 if (elapsed > _pollingStallThreshold)
                                 {
@@ -885,7 +942,7 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     finally
                     {
-                        _config.WatchdogRunning = false;
+                        _config.SystemWatchdogRunning = false;
                         lock (_watchdogLock)
                         {
                             if (!_disposed)
@@ -955,38 +1012,44 @@ namespace Pulsar_DomeDriver.Driver
                         try
                         {
                             await Task.Delay(_autoReconnectInterval, token);
-
-                            if (!_connected && _reconnectAttempts < _maxReconnectAttempts)
-                            {
-                                SafeLog("Attempting auto-reconnect to dome controller.", LogLevel.Info);
-                                _reconnectAttempts++;
-
-                                try
-                                {
-                                    Connected = true;
-                                    if (_connected)
-                                    {
-                                        SafeLog("Auto-reconnect successful.", LogLevel.Info);
-                                        _GNS.SendGNS(GNSType.Message, "Dome driver auto-reconnected");
-                                        _reconnectAttempts = 0;
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    SafeLog($"Auto-reconnect attempt {_reconnectAttempts} failed: {ex.Message}", LogLevel.Warning);
-                                    if (_reconnectAttempts >= _maxReconnectAttempts)
-                                    {
-                                        SafeLog("Max auto-reconnect attempts reached. Entering safe mode.", LogLevel.Error);
-                                        _GNS.SendGNS(GNSType.Alarm, "Dome driver max auto-reconnect attempts exceeded");
-                                        EnterSafeMode();
-                                    }
-                                }
-                            }
                         }
                         catch (TaskCanceledException)
                         {
                             SafeLog("Auto-reconnect cancelled.", LogLevel.Debug);
                             break;
+                        }
+
+                        if (_manualDisconnect || _config.Resetting || _config.Rebooting)
+                        {
+                            _reconnectAttempts = 0;
+                            continue;
+                        }
+
+                        if (!_connected && _reconnectAttempts < _maxReconnectAttempts)
+                        {
+                            SafeLog("Attempting auto-reconnect to dome controller.", LogLevel.Info);
+                            _reconnectAttempts++;
+
+                            try
+                            {
+                                Connected = true;
+                                if (_connected)
+                                {
+                                    SafeLog("Auto-reconnect successful.", LogLevel.Info);
+                                    _GNS.SendGNS(GNSType.Message, "Dome driver auto-reconnected");
+                                    _reconnectAttempts = 0;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                SafeLog($"Auto-reconnect attempt {_reconnectAttempts} failed: {ex.Message}", LogLevel.Warning);
+                                if (_reconnectAttempts >= _maxReconnectAttempts)
+                                {
+                                    SafeLog("Max auto-reconnect attempts reached. Entering safe mode.", LogLevel.Error);
+                                    _GNS.SendGNS(GNSType.Alarm, "Dome driver max auto-reconnect attempts exceeded");
+                                    EnterSafeMode();
+                                }
+                            }
                         }
                     }
                 }, token);
@@ -1025,6 +1088,7 @@ namespace Pulsar_DomeDriver.Driver
             lock (_alarmTimerLock)
             {
                 _alarmTimerCts?.Cancel();
+                _alarmTimerCts?.Dispose();
                 _alarmTimerCts = new CancellationTokenSource();
                 var token = _alarmTimerCts.Token;
 
@@ -1577,13 +1641,13 @@ namespace Pulsar_DomeDriver.Driver
                 _systemWatchdogCts?.Cancel();
 
                 var timeout = Task.Delay(5000);
-                while (_config.WatchdogRunning && !timeout.IsCompleted)
+                while (_config.SystemWatchdogRunning && !timeout.IsCompleted)
                 {
                     SafeLog("Waiting for watchdog to exit...", LogLevel.Trace);
                     await Task.Delay(200);
                 }
 
-                if (_config.WatchdogRunning)
+                if (_config.SystemWatchdogRunning)
                 {
                     SafeLog("Watchdog did not exit after cancellation — aborting reset.", LogLevel.Error);
                     _GNS.SendGNS(GNSType.Alarm, "Reset aborted: watchdog failed to exit after cancellation.");
@@ -1602,7 +1666,7 @@ namespace Pulsar_DomeDriver.Driver
             bool softOnly = reset == "soft";
             bool hardOnly = reset == "hard";
 
-            StopPolling();
+            StopPolling(force: true);
             _config.ControllerReady = false;
 
             SafeLog("Triggering ResetRoutine due to command error or stall.", LogLevel.Info);
@@ -2012,12 +2076,18 @@ namespace Pulsar_DomeDriver.Driver
         //
         // Task.Run(async () => await _mqttPublisher.PublishAsync("dome/status", "Some message");
 
-        public async Task StartMQTTAsync()
+        public async Task<bool> StartMQTTAsync()
         {
             SafeLog("StartMQTTAsync entered", LogLevel.Debug);
 
             try
             {
+                if (_mqttPublisher != null)
+                {
+                    try { _mqttPublisher.Dispose(); } catch { }
+                    _mqttPublisher = null;
+                }
+
                 _mqttPublisher = new MqttPublisher(_logger, _config);
                 SafeLog("MqttPublisher instance created", LogLevel.Debug);
 
@@ -2031,10 +2101,12 @@ namespace Pulsar_DomeDriver.Driver
                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                 var completedTask = await Task.WhenAny(connectedTask, timeoutTask);
                 
-                if (completedTask == timeoutTask)
+                if (completedTask == timeoutTask || _mqttPublisher.IsConnected == false)
                 {
                     SafeLog("MQTT connection timeout", LogLevel.Error);
-                    throw new Exception("MQTT connection timeout");
+                    try { _mqttPublisher.Dispose(); } catch { }
+                    _mqttPublisher = null;
+                    return false;
                 }
 
                 SafeLog("MQTT connection confirmed", LogLevel.Info);
@@ -2043,10 +2115,14 @@ namespace Pulsar_DomeDriver.Driver
                 SafeLog($"Publishing startup message: '{startupMessage}'", LogLevel.Debug);
                 TryMQTTPublish(_mqttStatus, startupMessage);
                 SafeLog("Startup message published", LogLevel.Debug);
+                return true;
             }
             catch (Exception ex)
             {
-                SafeLog($"StartDriverAsync failed: {ex}", LogLevel.Error);
+                SafeLog($"StartMQTTAsync failed: {ex}", LogLevel.Error);
+                try { _mqttPublisher?.Dispose(); } catch { }
+                _mqttPublisher = null;
+                return false;
             }
         }
         // Null-safe, non-blocking MQTT publish
@@ -2248,7 +2324,22 @@ namespace Pulsar_DomeDriver.Driver
                 catch (Exception ex) { failures.Add($"{name}: {ex.Message}"); }
             }
 
+            SafeDispose(() =>
+            {
+                if (_processExitHandler != null)
+                {
+                    AppDomain.CurrentDomain.ProcessExit -= _processExitHandler;
+                    _processExitHandler = null;
+                }
+                if (_domainUnloadHandler != null)
+                {
+                    AppDomain.CurrentDomain.DomainUnload -= _domainUnloadHandler;
+                    _domainUnloadHandler = null;
+                }
+            }, "AppDomainHandlers");
+
             SafeDispose(() => StopPolling(), "StopPolling");
+            SafeDispose(() => CancelCurrentActionWatchdog(), "CancelCurrentActionWatchdog");
             SafeDispose(() => StopWatchdog(), "StopWatchdog");
             SafeDispose(() => StopAutoReconnect(), "StopAutoReconnect");
             SafeDispose(() => DisconnectMqttSafely(), "DisconnectMqttSafely");
@@ -2317,9 +2408,14 @@ namespace Pulsar_DomeDriver.Driver
         {
             try
             {
-                if (_mqttPublisher != null && _mqttPublisher.IsConnected)
+                if (_mqttPublisher != null)
                 {
-                    _mqttPublisher.DisconnectAsync().GetAwaiter().GetResult();
+                    if (_mqttPublisher.IsConnected)
+                    {
+                        _mqttPublisher.DisconnectAsync().GetAwaiter().GetResult();
+                    }
+                    _mqttPublisher.Dispose();
+                    _mqttPublisher = null;
                 }
             }
             catch
@@ -2823,7 +2919,7 @@ double? gnsTimeoutFactor = null)
 
                     CancelCurrentActionWatchdog();
 
-                    _config.WatchdogRunning = false;
+                    _config.ActionWatchdogRunning = false;
                     _lastIntent = DomeCommandIntent.None;
 
                     _GNS.SendGNS(GNSType.Cease, "Abort succeeded.");
@@ -2915,7 +3011,7 @@ double? gnsTimeoutFactor = null)
             try { _actionWatchdogCts?.Dispose(); } catch { }
             _actionWatchdogCts = null;
 
-            _config.WatchdogRunning = false;
+            _config.ActionWatchdogRunning = false;
         }
 
         // Convenience wrappers to keep status logs consistent
@@ -3025,3 +3121,6 @@ double? gnsTimeoutFactor = null)
 
     }
 }
+
+
+

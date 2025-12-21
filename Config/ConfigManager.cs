@@ -347,7 +347,8 @@ namespace Pulsar_DomeDriver.Config
         private int _resettingInt = 0;
         private int _forceBusyInt = 0;
         private int _controllerReadyInt = 0;
-        private int _watchdogRunningInt = 0;
+        private int _systemWatchdogRunningInt = 0;
+        private int _actionWatchdogRunningInt = 0;
         private int _commandInProgressInt = 0;
         private int _slewingStatusInt = 0;
 
@@ -387,10 +388,16 @@ namespace Pulsar_DomeDriver.Config
             set => Interlocked.Exchange(ref _controllerReadyInt, value ? 1 : 0);
         }
 
-        public bool WatchdogRunning
+        public bool SystemWatchdogRunning
         {
-            get => Interlocked.CompareExchange(ref _watchdogRunningInt, 0, 0) == 1;
-            set => Interlocked.Exchange(ref _watchdogRunningInt, value ? 1 : 0);
+            get => Interlocked.CompareExchange(ref _systemWatchdogRunningInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _systemWatchdogRunningInt, value ? 1 : 0);
+        }
+
+        public bool ActionWatchdogRunning
+        {
+            get => Interlocked.CompareExchange(ref _actionWatchdogRunningInt, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _actionWatchdogRunningInt, value ? 1 : 0);
         }
 
         public bool SoftResetAttempted { get; set; } = false;
