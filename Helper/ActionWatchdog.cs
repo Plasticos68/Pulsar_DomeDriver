@@ -181,7 +181,7 @@ namespace Pulsar_DomeDriver.Helper
                     await _mqttPublisher.PublishAsync(topic, message);
                     //WatchdogLogger.Log($"[{_action}] MQTT published: {message}");
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     //WatchdogLogger.Log($"[{_action}] MQTT publish failed: {ex.Message}");
                 }

@@ -35,7 +35,16 @@ namespace Pulsar_DomeDriver.MQTT
 
         public async Task InitializeAsync(string brokerIp, string port)
         {
-            int portNumber = int.Parse(port);
+            if (string.IsNullOrWhiteSpace(brokerIp))
+            {
+                brokerIp = "localhost";
+            }
+
+            if (!int.TryParse(port, out int portNumber))
+            {
+                portNumber = 1883;
+                SafeLog($"[MQTT] Invalid port '{port}', defaulting to {portNumber}", LogLevel.Warning);
+            }
             if (_disposed) return;
             SafeLog("[MQTT] InitializeAsync entered", LogLevel.Trace);
 

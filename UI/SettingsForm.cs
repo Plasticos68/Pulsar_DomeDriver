@@ -71,8 +71,8 @@ namespace Pulsar_DomeDriver.UI
             txtBoxOffParameters.Text = _config.ResetOffParameters;
             txtBoxOffParameters.Enabled = checkBoxExternalReset.Checked;
 
-            txtBoxShutterTimeout.Text = (_config.ShutterTimeout / 1000).ToString();
-            txtBoxRotationTimeout.Text = (_config.RotationTimeout / 1000).ToString();
+            txtBoxShutterTimeout.Text = _config.ShutterTimeout.ToString();
+            txtBoxRotationTimeout.Text = _config.RotationTimeout.ToString();
             txtBoxResetDelay.Text = (_config.ResetDelay / 1000).ToString();
             txtBoxCycleDelay.Text = (_config.CycleDelay / 1000).ToString();
 
@@ -80,6 +80,19 @@ namespace Pulsar_DomeDriver.UI
 
             txtBoxMQTTip.Text = _config.MQTTip;
             txtBoxMQTTport.Text = _config.MQTTport;
+
+            chkBoxUseLocalhost.Checked = _config.MQTTLocalHost;
+            chkBoxUseLocalhost.Enabled = chkBoxMQTT.Checked;
+            
+            // Ensure consistency: if localhost is checked, IP should be localhost
+            if (chkBoxUseLocalhost.Checked)
+            {
+                txtBoxMQTTip.Text = "localhost";
+                txtBoxMQTTport.Text = "1883";
+            }
+            
+            txtBoxMQTTip.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
+            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
         }
 
         private void btnOK_Click(object sender, EventArgs e)
@@ -97,8 +110,19 @@ namespace Pulsar_DomeDriver.UI
             _config.UseGNS = chkBoxGNS.Checked;
             _config.GNSPath = txtBoxGNSLocation.Text;
             _config.GNSDispatcherPath = txtBoxGNSDispatherLocation.Text;
-            _config.MQTTip = txtBoxMQTTip.Text;
-            _config.MQTTport = txtBoxMQTTport.Text;
+
+            _config.MQTTLocalHost = chkBoxUseLocalhost.Checked;
+
+            if (chkBoxUseLocalhost.Checked)
+            {
+                _config.MQTTip = "localhost";
+                _config.MQTTport = "1883";
+            }
+            else
+            {
+                _config.MQTTip = txtBoxMQTTip.Text;
+                _config.MQTTport = txtBoxMQTTport.Text;
+            }
 
             if (int.TryParse(txtBoxResetDelay.Text, out int resetDelay))
             {
@@ -160,8 +184,9 @@ namespace Pulsar_DomeDriver.UI
 
         private void chkBoxMQTT_CkeckedChanged(object sender, EventArgs e)
         {
-            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked;
-            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked;
+            chkBoxUseLocalhost.Enabled = chkBoxMQTT.Checked;
+            txtBoxMQTTip.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
+            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
         }
 
         private void chkBoxGNS_CheckedChanged(object sender, EventArgs e)
@@ -285,6 +310,26 @@ namespace Pulsar_DomeDriver.UI
                     txtBoxGNSDispatherLocation.Text = fileDialog.FileName;
                 }
             }
+        }
+
+        private void chkBoxMQTT_CheckedChanged(object sender, EventArgs e)
+        {
+            chkBoxUseLocalhost.Enabled = chkBoxMQTT.Checked;
+            txtBoxMQTTip.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
+            txtBoxMQTTport.Enabled = chkBoxMQTT.Checked && !chkBoxUseLocalhost.Checked;
+        }
+
+        private void chkBoxUseLocalhost_CheckedChanged(object sender, EventArgs e)
+        {
+            if (chkBoxUseLocalhost.Checked)
+            {
+                txtBoxMQTTip.Text = "localhost";
+                txtBoxMQTTport.Text = "1883";
+            }
+            // When unchecked, just enable the text boxes - user can enter custom values
+            
+            txtBoxMQTTip.Enabled = !chkBoxUseLocalhost.Checked;
+            txtBoxMQTTport.Enabled = !chkBoxUseLocalhost.Checked;
         }
     }
 }

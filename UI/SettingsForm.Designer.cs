@@ -73,6 +73,7 @@
             this.txtBoxMQTTip = new System.Windows.Forms.TextBox();
             this.txtBoxMQTTport = new System.Windows.Forms.TextBox();
             this.label13 = new System.Windows.Forms.Label();
+            this.chkBoxUseLocalhost = new System.Windows.Forms.CheckBox();
             this.groupBox4 = new System.Windows.Forms.GroupBox();
             this.groupBox1.SuspendLayout();
             this.groupBox2.SuspendLayout();
@@ -456,7 +457,7 @@
             this.chkBoxMQTT.TabIndex = 56;
             this.chkBoxMQTT.Text = "MQTT";
             this.chkBoxMQTT.UseVisualStyleBackColor = true;
-            this.chkBoxMQTT.CheckedChanged += new System.EventHandler(this.chkBoxMQTT_CkeckedChanged);
+            this.chkBoxMQTT.CheckedChanged += new System.EventHandler(this.chkBoxMQTT_CheckedChanged);
             // 
             // chkBoxGNS
             // 
@@ -550,12 +551,13 @@
             this.groupBox3.Controls.Add(this.txtBoxMQTTport);
             this.groupBox3.Controls.Add(this.chkBoxMQTT);
             this.groupBox3.Controls.Add(this.label13);
+            this.groupBox3.Controls.Add(this.chkBoxUseLocalhost);
             this.groupBox3.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.groupBox3.Location = new System.Drawing.Point(55, 371);
             this.groupBox3.Margin = new System.Windows.Forms.Padding(4);
             this.groupBox3.Name = "groupBox3";
             this.groupBox3.Padding = new System.Windows.Forms.Padding(4);
-            this.groupBox3.Size = new System.Drawing.Size(956, 247);
+            this.groupBox3.Size = new System.Drawing.Size(956, 280);
             this.groupBox3.TabIndex = 64;
             this.groupBox3.TabStop = false;
             this.groupBox3.Text = "MQTT";
@@ -564,7 +566,7 @@
             // 
             this.label14.AutoSize = true;
             this.label14.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.label14.Location = new System.Drawing.Point(34, 102);
+            this.label14.Location = new System.Drawing.Point(30, 128);
             this.label14.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.label14.Name = "label14";
             this.label14.Size = new System.Drawing.Size(40, 32);
@@ -574,7 +576,7 @@
             // txtBoxMQTTip
             // 
             this.txtBoxMQTTip.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.txtBoxMQTTip.Location = new System.Drawing.Point(308, 95);
+            this.txtBoxMQTTip.Location = new System.Drawing.Point(308, 125);
             this.txtBoxMQTTip.Margin = new System.Windows.Forms.Padding(4);
             this.txtBoxMQTTip.Name = "txtBoxMQTTip";
             this.txtBoxMQTTip.Size = new System.Drawing.Size(481, 39);
@@ -583,7 +585,7 @@
             // txtBoxMQTTport
             // 
             this.txtBoxMQTTport.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.txtBoxMQTTport.Location = new System.Drawing.Point(308, 155);
+            this.txtBoxMQTTport.Location = new System.Drawing.Point(308, 185);
             this.txtBoxMQTTport.Margin = new System.Windows.Forms.Padding(4);
             this.txtBoxMQTTport.Name = "txtBoxMQTTport";
             this.txtBoxMQTTport.Size = new System.Drawing.Size(481, 39);
@@ -593,12 +595,26 @@
             // 
             this.label13.AutoSize = true;
             this.label13.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.label13.Location = new System.Drawing.Point(34, 155);
+            this.label13.Location = new System.Drawing.Point(30, 181);
             this.label13.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.label13.Name = "label13";
             this.label13.Size = new System.Drawing.Size(66, 32);
             this.label13.TabIndex = 60;
             this.label13.Text = "Port";
+            // 
+            // chkBoxUseLocalhost
+            // 
+            this.chkBoxUseLocalhost.AutoSize = true;
+            this.chkBoxUseLocalhost.CheckAlign = System.Drawing.ContentAlignment.MiddleRight;
+            this.chkBoxUseLocalhost.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.chkBoxUseLocalhost.Location = new System.Drawing.Point(308, 54);
+            this.chkBoxUseLocalhost.Margin = new System.Windows.Forms.Padding(4);
+            this.chkBoxUseLocalhost.Name = "chkBoxUseLocalhost";
+            this.chkBoxUseLocalhost.Size = new System.Drawing.Size(220, 36);
+            this.chkBoxUseLocalhost.TabIndex = 64;
+            this.chkBoxUseLocalhost.Text = "Use Localhost";
+            this.chkBoxUseLocalhost.UseVisualStyleBackColor = true;
+            this.chkBoxUseLocalhost.CheckedChanged += new System.EventHandler(this.chkBoxUseLocalhost_CheckedChanged);
             // 
             // groupBox4
             // 
@@ -694,5 +710,6 @@
         private System.Windows.Forms.TextBox txtBoxMQTTport;
         private System.Windows.Forms.Label label13;
         private System.Windows.Forms.GroupBox groupBox4;
+        private System.Windows.Forms.CheckBox chkBoxUseLocalhost;
     }
 }

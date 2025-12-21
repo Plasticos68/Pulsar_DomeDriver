@@ -91,7 +91,7 @@ namespace Pulsar_DomeDriver.Helper
                     _port.DiscardOutBuffer();
                     Thread.Sleep(50); // optional: settle before write
 
-                    _port.Write($"{command}\r");
+                    _port.Write($"{command}\r\n");
                     SafeLog($"Sending {command}", LogLevel.Debug);
 
                     if (!expectResponse)

@@ -38,7 +38,7 @@ namespace Pulsar_DomeDriver.Driver
 
         // connection
         private bool _connected = false;
-        private readonly string _pingResponse = "Y159";
+        private readonly string _pingResponse = "Y519";
         private readonly string _generalResponse = "A";
 
         // extras
@@ -61,14 +61,27 @@ namespace Pulsar_DomeDriver.Driver
         private Task? _systemWatchdogTask;
         private readonly TimeSpan _systemWatchdogInterval = TimeSpan.FromSeconds(5);         // How often to check
         private readonly TimeSpan _pollingStallThreshold = TimeSpan.FromSeconds(10);
-        //private volatile bool _config.CommandInProgress = false;
         private bool _rebooting = false;
         private int _watchdogGeneration = 0;
         private readonly object _alarmTimerLock = new();
         private CancellationTokenSource _alarmTimerCts;
         private Task _alarmTimerTask;
         private DateTime _lastWatchdogPing = DateTime.UtcNow;
+        private DateTime _lastGNSHeartbeat = DateTime.MinValue;
         private readonly TimeSpan _alarmTimeout = TimeSpan.FromSeconds(30); // or 2× watchdog interval
+
+        // Auto-reconnect
+        private CancellationTokenSource? _autoReconnectCts;
+        private Task? _autoReconnectTask;
+        private readonly TimeSpan _autoReconnectInterval = TimeSpan.FromMinutes(1);
+        private int _reconnectAttempts = 0;
+        private readonly int _maxReconnectAttempts = 10;
+
+        // Metrics
+        private int _commandSuccessCount = 0;
+        private int _commandFailureCount = 0;
+        private DateTime _lastCommandTime = DateTime.MinValue;
+        private TimeSpan _totalCommandTime = TimeSpan.Zero;
 
         // Dome/Shutter status variables
         private string oldDomeActivity;
@@ -106,6 +119,11 @@ namespace Pulsar_DomeDriver.Driver
 
         #endregion
 
+        /// <summary>
+        /// Initializes a new instance of the Pulsar Dome Driver.
+        /// Sets up logging, configuration validation, serial port initialization, and monitoring systems.
+        /// Sends GNS notification on successful initialization.
+        /// </summary>
         public DomeDriver()
         {
             try
@@ -117,8 +135,12 @@ namespace Pulsar_DomeDriver.Driver
                 initialProfile.DeviceType = "Dome";
                 _profile = initialProfile;
 
-                // Resolve and constructlog directory
+                // Resolve and construct log directory
                 string regLogPath = _profile.GetValue(driverId, "LogLocation", "");
+                if (string.IsNullOrWhiteSpace(regLogPath))
+                {
+                    regLogPath = _profile.GetValue(driverId + ".LogLocation", "");
+                }
                 if (string.IsNullOrWhiteSpace(regLogPath))
                 {
                     regLogPath = Path.Combine(
@@ -136,25 +158,63 @@ namespace Pulsar_DomeDriver.Driver
 
                 string traceRaw = _profile.GetValue(driverId, "TraceLog", "");
                 bool traceLog = string.Equals(traceRaw, "true", StringComparison.OrdinalIgnoreCase);
-                SafeLog($"Registry DebugLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
+                SafeLog($"Registry TraceLog = '{traceRaw}' → parsed as {traceLog}", LogLevel.Debug);
 
                 // Initialize logger, config and GNS
                 _logger = new FileLogger(logPath, debugLog, traceLog);
                 _config = new ConfigManager(_profile, _logger);
                 _GNS = new GNS(_logger, _config);
 
-                //int _pollingIntervalMs = _config.pollingIntervalMs;
+                // Validate critical configuration
+                ValidateConfiguration();
 
                 // Proceed with driver setup
                 InitializeSerialPort();
                 AppDomain.CurrentDomain.ProcessExit += (_, __) => Dispose();
                 AppDomain.CurrentDomain.DomainUnload += (_, __) => Dispose();
+
+                // Send startup GNS message
+                _GNS.SendGNS(GNSType.Message, "Dome driver initialized successfully");
             }
             catch (Exception ex)
             {
-                SafeLog($"Driver initialization failed: {ex}", LogLevel.Error);
+                // Emergency logging if logger not initialized
+                try { _logger?.Log($"Driver initialization failed: {ex}", LogLevel.Error); }
+                catch { /* ignore */ }
+
+                // Send GNS alarm even if initialization fails
+                try { _GNS?.SendGNS(GNSType.Alarm, $"Dome driver initialization failed: {ex.Message}"); }
+                catch { /* ignore */ }
+
                 throw;
             }
+        }
+
+        private void ValidateConfiguration()
+        {
+            var issues = new List<string>();
+
+            if (_config.pollingIntervalMs < 500 || _config.pollingIntervalMs > 10000)
+                issues.Add($"Polling interval {_config.pollingIntervalMs}ms is out of safe range (500-10000ms)");
+
+            if (_config.RotationTimeout < 10 || _config.RotationTimeout > 300)
+                issues.Add($"Rotation timeout {_config.RotationTimeout}s is out of safe range (10-300s)");
+
+            if (_config.ShutterTimeout < 10 || _config.ShutterTimeout > 300)
+                issues.Add($"Shutter timeout {_config.ShutterTimeout}s is out of safe range (10-300s)");
+
+            if (_config.sendVerifyMaxRetries < 1 || _config.sendVerifyMaxRetries > 10)
+                issues.Add($"Send/verify retries {_config.sendVerifyMaxRetries} is out of safe range (1-10)");
+
+            if (issues.Any())
+            {
+                string message = $"Configuration validation failed: {string.Join("; ", issues)}";
+                SafeLog(message, LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, message);
+                throw new System.InvalidOperationException(message);
+            }
+
+            SafeLog("Configuration validation passed", LogLevel.Info);
         }
 
         #region Connection
@@ -172,12 +232,17 @@ namespace Pulsar_DomeDriver.Driver
                     DataBits = 8,
                     StopBits = StopBits.One,
                     Handshake = Handshake.None,
-                    ReadTimeout = 500,
+                    ReadTimeout = 2000,
                     WriteTimeout = 500
                 };
             }
         }
 
+        /// <summary>
+        /// Gets or sets the connection state of the dome driver.
+        /// When set to true, attempts to connect to the dome controller.
+        /// When set to false, disconnects and stops monitoring.
+        /// </summary>
         public bool Connected
         {
             get => _connected;
@@ -344,7 +409,7 @@ namespace Pulsar_DomeDriver.Driver
                 return false;
             }
 
-            //Thread.Sleep(_config.initialPingDelay);
+            Thread.Sleep(_config.initialPingDelay);
 
             for (int attempt = 0; attempt < 2; attempt++)
             {
@@ -388,6 +453,7 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }
 
+            _GNS.SendGNS(GNSType.Alarm, "Failed to connect to dome controller after multiple attempts");
             return false;
         }
 
@@ -718,6 +784,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             StartAlarmMonitor();
             StartWatchdog();
+            StartAutoReconnect();
         }
 
         private void StartWatchdog()
@@ -777,6 +844,13 @@ namespace Pulsar_DomeDriver.Driver
                                 else
                                 {
                                     SafeLog("[Watchdog] MQTT not connected — heartbeat skipped", LogLevel.Warning);
+                                }
+
+                                // 🧠 GNS heartbeat every 5 minutes (300 seconds)
+                                if ((DateTime.UtcNow - _lastGNSHeartbeat).TotalSeconds >= 300)
+                                {
+                                    _GNS.SendGNS(GNSType.Message, $"Dome driver heartbeat: Azimuth {_config.Azimuth:F1}°, Shutter {_config.ShutterStatus}, Connected {_connected}");
+                                    _lastGNSHeartbeat = DateTime.UtcNow;
                                 }
 
                                 // 🧠 Polling stall detection
@@ -840,6 +914,110 @@ namespace Pulsar_DomeDriver.Driver
                 _systemWatchdogCts = null;
             }
             _systemWatchdogTask = null;
+        }
+
+        private void StartAutoReconnect()
+        {
+            lock (_watchdogLock)
+            {
+                if (_disposed) return;
+
+                try
+                {
+                    _autoReconnectCts?.Cancel();
+                    _autoReconnectCts?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    SafeLog($"Error disposing previous auto-reconnect CTS: {ex.Message}", LogLevel.Warning);
+                }
+
+                _autoReconnectCts = new CancellationTokenSource();
+                var token = _autoReconnectCts.Token;
+
+                _autoReconnectTask = Task.Run(async () =>
+                {
+                    lock (_watchdogLock)
+                    {
+                        if (_disposed) return;
+                    }
+
+                    try { SafeLog("Auto-reconnect monitor started.", LogLevel.Debug); } catch { }
+
+                    while (true)
+                    {
+                        lock (_watchdogLock)
+                        {
+                            if (_disposed || token.IsCancellationRequested)
+                                break;
+                        }
+
+                        try
+                        {
+                            await Task.Delay(_autoReconnectInterval, token);
+
+                            if (!_connected && _reconnectAttempts < _maxReconnectAttempts)
+                            {
+                                SafeLog("Attempting auto-reconnect to dome controller.", LogLevel.Info);
+                                _reconnectAttempts++;
+
+                                try
+                                {
+                                    Connected = true;
+                                    if (_connected)
+                                    {
+                                        SafeLog("Auto-reconnect successful.", LogLevel.Info);
+                                        _GNS.SendGNS(GNSType.Message, "Dome driver auto-reconnected");
+                                        _reconnectAttempts = 0;
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    SafeLog($"Auto-reconnect attempt {_reconnectAttempts} failed: {ex.Message}", LogLevel.Warning);
+                                    if (_reconnectAttempts >= _maxReconnectAttempts)
+                                    {
+                                        SafeLog("Max auto-reconnect attempts reached. Entering safe mode.", LogLevel.Error);
+                                        _GNS.SendGNS(GNSType.Alarm, "Dome driver max auto-reconnect attempts exceeded");
+                                        EnterSafeMode();
+                                    }
+                                }
+                            }
+                        }
+                        catch (TaskCanceledException)
+                        {
+                            SafeLog("Auto-reconnect cancelled.", LogLevel.Debug);
+                            break;
+                        }
+                    }
+                }, token);
+            }
+        }
+
+        private void StopAutoReconnect()
+        {
+            if (_autoReconnectCts != null)
+            {
+                SafeLog("Stopping auto-reconnect monitor.", LogLevel.Debug);
+
+                try
+                {
+                    _autoReconnectCts.Cancel();
+                }
+                catch (Exception ex)
+                {
+                    SafeLog($"Error cancelling auto-reconnect: {ex.Message}", LogLevel.Error);
+                }
+                _autoReconnectCts.Dispose();
+                _autoReconnectCts = null;
+            }
+            _autoReconnectTask = null;
+        }
+
+        private void EnterSafeMode()
+        {
+            SafeLog("Entering safe mode - dome operations suspended.", LogLevel.Error);
+            // Could implement safe positioning here if needed
+            _GNS.SendGNS(GNSType.Alarm, "Dome driver entered safe mode");
         }
 
         private void StartAlarmMonitor()
@@ -913,6 +1091,9 @@ namespace Pulsar_DomeDriver.Driver
                 TryMQTTPublish(_mqttAlarm, "On");
                 SafeLog("Alarm triggered: status 'On' published", LogLevel.Warning);
 
+                string alarmMessage = message ?? "Dome driver alarm triggered";
+                _GNS.SendGNS(GNSType.Alarm, alarmMessage);
+
                 if (!string.IsNullOrWhiteSpace(message))
                 {
                     TryMQTTPublish(_mqttAlarmMessage, message);
@@ -943,6 +1124,12 @@ namespace Pulsar_DomeDriver.Driver
 
         public void SystemStatus()
         {
+            if (_guard == null || !_guard.IsReady)
+            {
+                SafeLog("[DomeStatus] Skipped because serial port not ready (likely disconnecting)", LogLevel.Debug);
+                return;
+            }
+
             var retryPolicy = new RetryPolicy
             {
                 MaxAttempts = _config.statusMaxRetries,
@@ -975,10 +1162,17 @@ namespace Pulsar_DomeDriver.Driver
 
                 CompleteSystemStatus();
             }
-            catch (TimeoutException)
+            catch (TimeoutException ex)
             {
-                SafeLog("[DomeStatus] Status check failed after retries — raising alarm", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, "Dome status failed after retries");
+                SafeLog($"[DomeStatus] Status check failed after retries — raising alarm: {ex.Message}", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, $"Dome status check failed after {_config.statusMaxRetries} retries");
+                AlarmOn("Status check timeout");
+            }
+            catch (Exception ex)
+            {
+                SafeLog($"[DomeStatus] Unexpected error during status check: {ex}", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Alarm, $"Dome status check error: {ex.Message}");
+                AlarmOn($"Status check error: {ex.Message}");
             }
         }
 
@@ -1080,6 +1274,20 @@ namespace Pulsar_DomeDriver.Driver
             if (string.IsNullOrWhiteSpace(raw))
             {
                 SafeLog("Empty or null dome response.", LogLevel.Error);
+                return false;
+            }
+
+            // Validate response length to prevent buffer overflow attacks
+            if (raw.Length > 1024)
+            {
+                SafeLog($"Dome response too long: {raw.Length} characters. Possible corruption.", LogLevel.Error);
+                return false;
+            }
+
+            // Check for invalid characters (only allow printable ASCII and tabs)
+            if (raw.Any(c => c < 32 && c != 9 && c != 10 && c != 13))
+            {
+                SafeLog("Dome response contains invalid control characters.", LogLevel.Error);
                 return false;
             }
 
@@ -1765,6 +1973,31 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
+        /// <summary>
+        /// Gets current driver metrics for monitoring and diagnostics.
+        /// </summary>
+        /// <returns>A dictionary containing metric names and values.</returns>
+        public Dictionary<string, object> GetMetrics()
+        {
+            var metrics = new Dictionary<string, object>
+            {
+                ["CommandSuccessCount"] = _commandSuccessCount,
+                ["CommandFailureCount"] = _commandFailureCount,
+                ["TotalCommands"] = _commandSuccessCount + _commandFailureCount,
+                ["SuccessRate"] = _commandSuccessCount + _commandFailureCount > 0 ?
+                    (double)_commandSuccessCount / (_commandSuccessCount + _commandFailureCount) : 0.0,
+                ["LastCommandTime"] = _lastCommandTime,
+                ["AverageCommandTime"] = _commandSuccessCount > 0 ?
+                    _totalCommandTime.TotalMilliseconds / _commandSuccessCount : 0.0,
+                ["Connected"] = _connected,
+                ["ReconnectAttempts"] = _reconnectAttempts,
+                ["Azimuth"] = _config.Azimuth,
+                ["ShutterStatus"] = _config.ShutterStatus,
+                ["DomeState"] = _config.DomeState
+            };
+            return metrics;
+        }
+
         #endregion
 
         #region MQTT
@@ -1788,10 +2021,21 @@ namespace Pulsar_DomeDriver.Driver
                 _mqttPublisher = new MqttPublisher(_logger, _config);
                 SafeLog("MqttPublisher instance created", LogLevel.Debug);
 
-                SafeLog("Initializing MQTT connection...", LogLevel.Debug);
-                await _mqttPublisher.InitializeAsync(_config.MQTTip, _config.MQTTport);
+                string mqttIp = _config.MQTTip;
+                string mqttPort = _config.MQTTport;
+                SafeLog($"Initializing MQTT connection to {mqttIp}:{mqttPort}", LogLevel.Info);
+                await _mqttPublisher.InitializeAsync(mqttIp, mqttPort);
 
-                await _mqttPublisher.WaitForConnectedAsync(); // ✅ Add this line
+                // Wait for connection with timeout
+                var connectedTask = _mqttPublisher.WaitForConnectedAsync();
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
+                var completedTask = await Task.WhenAny(connectedTask, timeoutTask);
+                
+                if (completedTask == timeoutTask)
+                {
+                    SafeLog("MQTT connection timeout", LogLevel.Error);
+                    throw new Exception("MQTT connection timeout");
+                }
 
                 SafeLog("MQTT connection confirmed", LogLevel.Info);
 
@@ -1900,7 +2144,15 @@ namespace Pulsar_DomeDriver.Driver
 
             return retryPolicy.Execute(() =>
             {
+                var startTime = DateTime.UtcNow;
                 response = SendCommand(command, expectResponse);
+                var endTime = DateTime.UtcNow;
+                var duration = endTime - startTime;
+
+                // Update metrics
+                _totalCommandTime += duration;
+                _lastCommandTime = endTime;
+
                 SafeLog($"Loop count - {repeatLoop}", LogLevel.Debug);
                 SafeLog($"Sent - {command} \t got - {response}", LogLevel.Debug);
 
@@ -1908,17 +2160,20 @@ namespace Pulsar_DomeDriver.Driver
 
                 if (mode == ResponseMode.Blind)
                 {
+                    _commandSuccessCount++;
                     return new ResponseResult { Response = null, IsMatch = true, Command = command };
                 }
 
                 if (mode == ResponseMode.Raw)
                 {
+                    _commandSuccessCount++;
                     return new ResponseResult { Response = response, IsMatch = true, Command = command };
                 }
 
                 if ((mode == ResponseMode.MatchExact || mode == ResponseMode.MatchAny) && expectedResponses == null)
                 {
                     SafeLog($"Expected responses not provided for mode {mode}.", LogLevel.Error);
+                    _commandFailureCount++;
                     return new ResponseResult { Response = response, IsMatch = false, Command = command };
                 }
 
@@ -1930,6 +2185,7 @@ namespace Pulsar_DomeDriver.Driver
                     if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                     {
                         SafeLog("MatchExact succeeded — returning early", LogLevel.Debug);
+                        _commandSuccessCount++;
                         return new ResponseResult { Response = response, IsMatch = true, Command = command };
                     }
                 }
@@ -1941,11 +2197,13 @@ namespace Pulsar_DomeDriver.Driver
                         if (string.Equals(response?.Trim(), expected.Trim(), StringComparison.OrdinalIgnoreCase))
                         {
                             SafeLog($"Matched one of expected responses: {response}", LogLevel.Debug);
+                            _commandSuccessCount++;
                             return new ResponseResult { Response = response, IsMatch = true, Command = command };
                         }
                     }
                 }
 
+                _commandFailureCount++;
                 return new ResponseResult { Response = response, IsMatch = false, Command = command };
 
             }, result => result.IsMatch);
@@ -1992,6 +2250,7 @@ namespace Pulsar_DomeDriver.Driver
 
             SafeDispose(() => StopPolling(), "StopPolling");
             SafeDispose(() => StopWatchdog(), "StopWatchdog");
+            SafeDispose(() => StopAutoReconnect(), "StopAutoReconnect");
             SafeDispose(() => DisconnectMqttSafely(), "DisconnectMqttSafely");
             SafeDispose(() => StopAlarmMonitor(), "Stopping Watchdog alarm");
 
@@ -2040,6 +2299,7 @@ namespace Pulsar_DomeDriver.Driver
                 }, "PollingCancel");
 
                 SafeDispose(() => SafeLog("Driver disposed.", LogLevel.Info), "Logger.Log");
+                SafeDispose(() => _GNS.SendGNS(GNSType.Message, "Dome driver disposed"), "GNS.Message");
                 SafeDispose(() => _logger?.Dispose(), "Logger.Dispose");
             }
 
@@ -2369,7 +2629,7 @@ double? gnsTimeoutFactor = null)
             ExecuteDomeCommand(
                 command: "OPEN",
                 message: message,
-                timeoutMs: _config.ShutterTimeout,
+                timeoutMs: _config.ShutterTimeout * 1000,
                 intent: DomeCommandIntent.OpenShutter,
                 alreadyAtTarget: () => _config.ShutterStatus == 0,
                 updateConfigBeforeWatchdog: () =>
@@ -2400,7 +2660,7 @@ double? gnsTimeoutFactor = null)
             ExecuteDomeCommand(
                 command: "CLOSE",
                 message: message,
-                timeoutMs: _config.ShutterTimeout,
+                timeoutMs: _config.ShutterTimeout * 1000,
                 intent: DomeCommandIntent.CloseShutter,
                 alreadyAtTarget: () => _config.ShutterStatus == 1,
                 updateConfigBeforeWatchdog: () =>
@@ -2436,7 +2696,7 @@ double? gnsTimeoutFactor = null)
             ExecuteDomeCommand(
                 command: command,
                 message: message,
-                timeoutMs: _config.RotationTimeout,
+                timeoutMs: _config.RotationTimeout * 1000,
                 intent: DomeCommandIntent.SlewAzimuth,
                 alreadyAtTarget: () => Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance,
                 updateConfigBeforeWatchdog: () =>
@@ -2467,7 +2727,7 @@ double? gnsTimeoutFactor = null)
         public void FindHome()
         {
             string message = "Finding Home...";
-            int timeoutMs = _config.RotationTimeout;
+            int timeoutMs = _config.RotationTimeout * 1000;
             LogDome(message);
 
             ExecuteDomeCommand(
@@ -2500,7 +2760,7 @@ double? gnsTimeoutFactor = null)
         public void Park()
         {
             string message = "Parking...";
-            int timeoutMs = _config.RotationTimeout;
+            int timeoutMs = _config.RotationTimeout * 1000;
             LogDome(message);
 
             ExecuteDomeCommand(

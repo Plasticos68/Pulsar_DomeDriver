@@ -46,6 +46,23 @@ namespace Pulsar_DomeDriver.Config
             _logger = logger;
         }
 
+        private string GetProfileValue(string name, string defaultValue = "")
+        {
+            try
+            {
+                return _profile.GetValue(_driverId, name, defaultValue) ?? defaultValue;
+            }
+            catch (ASCOM.Utilities.Exceptions.DriverNotRegisteredException)
+            {
+                return _profile.GetValue(_driverId + "." + name, defaultValue) ?? defaultValue;
+            }
+        }
+
+        private void WriteProfileValue(string name, string value)
+        {
+            _profile.WriteValue(_driverId, name, value, "");
+        }
+
         public readonly string _driverId = "Pulsar_DomeDriver";
         public readonly string _description = "Pulsar Dome Driver with auto reset";
         public readonly string _driverInfo = "Pulsar DomeDriver";
@@ -93,22 +110,21 @@ namespace Pulsar_DomeDriver.Config
 
         public string SerialPort
         {
-            get => _profile.GetValue(_driverId, "SerialPort", "") ?? serialPort;
-            set => _profile.WriteValue(_driverId, "SerialPort", value, "");
+            get => GetProfileValue("SerialPort", "") ?? serialPort;
+            set => WriteProfileValue("SerialPort", value);
         }
 
         public bool SoftReset
         {
             get
             {
-
-                string resetString = _profile.GetValue(_driverId, "InternalReset", "");
+                string resetString = GetProfileValue("InternalReset", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "InternalReset", value.ToString().ToLower());
+                WriteProfileValue("InternalReset", value.ToString().ToLower());
             }
         }
 
@@ -116,51 +132,51 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string resetString = _profile.GetValue(_driverId, "ExternalReset", "");
+                string resetString = GetProfileValue("ExternalReset", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "ExternalReset", value.ToString().ToLower());
+                WriteProfileValue("ExternalReset", value.ToString().ToLower());
             }
         }
 
         public string LogLocation
         {
-            get => _profile.GetValue(_driverId, "LogLocation", "") ?? "";
-            set => _profile.WriteValue(_driverId, "LogLocation", value, "");
+            get => GetProfileValue("LogLocation", "") ?? "";
+            set => WriteProfileValue("LogLocation", value);
         }
 
         public string ResetExe
         {
-            get => _profile.GetValue(_driverId, "ResetExe", "") ?? "";
-            set => _profile.WriteValue(_driverId, "ResetExe", value, "");
+            get => GetProfileValue("ResetExe", "") ?? "";
+            set => WriteProfileValue("ResetExe", value);
         }
 
         public string ResetOnParameters
         {
-            get => _profile.GetValue(_driverId, "ResetOnParameters", "") ?? "";
-            set => _profile.WriteValue(_driverId, "ResetOnParameters", value, "");
+            get => GetProfileValue("ResetOnParameters", "") ?? "";
+            set => WriteProfileValue("ResetOnParameters", value);
         }
 
         public string ResetOffParameters
         {
-            get => _profile.GetValue(_driverId, "ResetOffParameters", "") ?? "";
-            set => _profile.WriteValue(_driverId, "ResetOffParameters", value, "");
+            get => GetProfileValue("ResetOffParameters", "") ?? "";
+            set => WriteProfileValue("ResetOffParameters", value);
         }
 
         public int ResetDelay
         {
             get
             {
-                string delayString = _profile.GetValue(_driverId, "ResetDelay", "");
+                string delayString = GetProfileValue("ResetDelay", "");
                 bool success = int.TryParse(delayString, out int result);
                 return success ? result * 1000: 5;
             }
             set
             {
-                _profile.WriteValue(_driverId, "ResetDelay", value.ToString());
+                WriteProfileValue("ResetDelay", value.ToString());
             }
         }
 
@@ -168,13 +184,13 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string delayString = _profile.GetValue(_driverId, "CycleDelay", "");
+                string delayString = GetProfileValue("CycleDelay", "");
                 bool success = int.TryParse(delayString, out int result);
                 return success ? result * 1000: 5;
             }
             set
             {
-                _profile.WriteValue(_driverId, "CycleDelay", value.ToString());
+                WriteProfileValue("CycleDelay", value.ToString());
             }
         }
 
@@ -182,19 +198,21 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string raw = _profile.GetValue(_driverId, "ShutterTimeout", "90");
+                string raw = GetProfileValue("ShutterTimeout", "90");
+                if (string.IsNullOrWhiteSpace(raw))
+                    raw = "90";
                 if (!int.TryParse(raw, out int seconds) || seconds < 10 || seconds > 600)
                 {
                     _logger?.Log($"Invalid ShutterTimeout '{raw}', using 90s", LogLevel.Warning);
-                    return 90000;
+                    return 90;
                 }
-                return seconds * 1000;
+                return seconds;
             }
             set
             {
                 if (value < 10 || value > 600)
                     throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
-                _profile.WriteValue(_driverId, "ShutterTimeout", (value).ToString());
+                WriteProfileValue("ShutterTimeout", value.ToString());
             }
         }
 
@@ -202,19 +220,21 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string raw = _profile.GetValue(_driverId, "RotationTimeout", "90");
+                string raw = GetProfileValue("RotationTimeout", "90");
+                if (string.IsNullOrWhiteSpace(raw))
+                    raw = "90";
                 if (!int.TryParse(raw, out int seconds) || seconds < 10 || seconds > 600)
                 {
                     _logger?.Log($"Invalid RotationTimeout '{raw}', using 90s", LogLevel.Warning);
-                    return 90000;
+                    return 90;
                 }
-                return seconds * 1000;
+                return seconds;
             }
             set
             {
                 if (value < 10 || value > 600)
                     throw new ArgumentOutOfRangeException(nameof(value), "Must be 10-600 seconds");
-                _profile.WriteValue(_driverId, "RotationTimeout", (value).ToString());
+                WriteProfileValue("RotationTimeout", value.ToString());
             }
         }
 
@@ -222,13 +242,13 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string resetString = _profile.GetValue(_driverId, "DebugLog", "");
+                string resetString = GetProfileValue("DebugLog", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "DebugLog", value.ToString().ToLower());
+                WriteProfileValue("DebugLog", value.ToString().ToLower());
             }
         }
 
@@ -236,13 +256,13 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string resetString = _profile.GetValue(_driverId, "TraceLog", "");
+                string resetString = GetProfileValue("TraceLog", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "TraceLog", value.ToString().ToLower());
+                WriteProfileValue("TraceLog", value.ToString().ToLower());
             }
         }
 
@@ -250,52 +270,74 @@ namespace Pulsar_DomeDriver.Config
         {
             get
             {
-                string resetString = _profile.GetValue(_driverId, "MQTT", "");
+                string resetString = GetProfileValue("MQTT", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "MQTT", value.ToString().ToLower());
+                WriteProfileValue("MQTT", value.ToString().ToLower());
             }
         }
 
         public string MQTTip
         {
-            get => _profile.GetValue(_driverId, "MQTTIP", "") ?? "10.17.1.92";
-            set => _profile.WriteValue(_driverId, "MQTTIP", value, "");
+            get
+            {
+                var value = GetProfileValue("MQTTIP", "localhost");
+                return string.IsNullOrWhiteSpace(value) ? "localhost" : value;
+            }
+            set => WriteProfileValue("MQTTIP", value);
         }
 
         public string MQTTport
         {
-            get => _profile.GetValue(_driverId, "MQTTPort", "") ?? "1883";
-            set => _profile.WriteValue(_driverId, "MQTTPort", value, "");
+            get
+            {
+                var value = GetProfileValue("MQTTPort", "1883");
+                return string.IsNullOrWhiteSpace(value) ? "1883" : value;
+            }
+            set => WriteProfileValue("MQTTPort", value);
+        }
+
+        public bool MQTTLocalHost
+        {
+            get
+            {
+                string resetString = GetProfileValue("MQTTLocalHost", "");
+                bool success = bool.TryParse(resetString, out bool result);
+                return success ? result : false;
+            }
+            set
+            {
+                WriteProfileValue("MQTTLocalHost", value.ToString().ToLower());
+            }
         }
 
         public bool UseGNS
         {
             get
             {
-                string resetString = _profile.GetValue(_driverId, "GNS", "");
+                string resetString = GetProfileValue("GNS", "");
                 bool success = bool.TryParse(resetString, out bool result);
                 return success ? result : false;
             }
             set
             {
-                _profile.WriteValue(_driverId, "GNS", value.ToString().ToLower());
+                WriteProfileValue("GNS", value.ToString().ToLower());
             }
         }
 
         public string GNSPath
         {
-            get => _profile.GetValue(_driverId, "GNSPath", "") ?? "";
-            set => _profile.WriteValue(_driverId, "GNSPath", value, "");
+            get => GetProfileValue("GNSPath", "") ?? "";
+            set => WriteProfileValue("GNSPath", value);
         }
 
         public string GNSDispatcherPath
         {
-            get => _profile.GetValue(_driverId, "GNSDispatcherPath", "") ?? "";
-            set => _profile.WriteValue(_driverId, "GNSDispatcherPath", value, "");
+            get => GetProfileValue("GNSDispatcherPath", "") ?? "";
+            set => WriteProfileValue("GNSDispatcherPath", value);
         }
 
         // These are read/written by multiple threads without locking
@@ -386,12 +428,13 @@ namespace Pulsar_DomeDriver.Config
                     ("GNSPath", ""),
                     ("GNSDispatcherPath", ""),
                     ("MQTTIP", "10.17.1.92"),
-                    ("MQTTPort", "1883")
+                    ("MQTTPort", "1883"),
+                    ("MQTTLocalHost", "false")
                 };
 
             foreach (var (name, value) in rootEntries)
             {
-                _profile.WriteValue(_driverId, name, value);
+                WriteProfileValue(name, value);
             }
         }
 
