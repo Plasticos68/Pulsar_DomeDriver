@@ -47,6 +47,7 @@ namespace Pulsar_DomeDriver.Driver
         private readonly object _resetLock = new();
         private readonly object _mqttLock = new();
         private readonly object _actionLock = new();
+        private readonly SemaphoreSlim _commandGate = new SemaphoreSlim(1, 1);
         private readonly object _watchdogLock = new object();
         private readonly object _connectionLock = new();
 
@@ -101,6 +102,8 @@ namespace Pulsar_DomeDriver.Driver
 
         // last command
         private DomeCommandIntent _lastIntent = DomeCommandIntent.None;
+        private const int MinSlewGraceMs = 3000;
+        private long _slewGraceUntilTicks = 0;
 
         // MQTT
         private MqttPublisher _mqttPublisher;
@@ -119,6 +122,7 @@ namespace Pulsar_DomeDriver.Driver
 
         // alarm
         private volatile bool _alarmTriggered = false;
+        private volatile bool _allowMqttAlarm = false;
         private readonly object _alarmLock = new();
 
         #endregion
@@ -277,9 +281,9 @@ namespace Pulsar_DomeDriver.Driver
                         if (!success)
                             throw new ASCOM.NotConnectedException("Failed to connect to controller.");
 
+                        bool mqttReady = false;
                         if (_config.UseMQTT)
                         {
-                            bool mqttReady = false;
                             try
                             {
                                 //StartMQTTAsync().GetAwaiter().GetResult(); // block until MQTT is ready
@@ -298,11 +302,11 @@ namespace Pulsar_DomeDriver.Driver
                             }
                             else
                             {
-                                SafeLog("MQTT unavailable - watchdog/alarm disabled.", LogLevel.Warning);
+                                SafeLog("MQTT unavailable - watchdog/alarm will run without MQTT.", LogLevel.Warning);
                             }
-
-                            StartSystemMonitors(startWatchdog: mqttReady);
                         }
+
+                        StartSystemMonitors(startWatchdog: true);
 
                         lock (_pollingLock)
                         {
@@ -342,7 +346,12 @@ namespace Pulsar_DomeDriver.Driver
 
             if (pollingStopped && pollingWaitTask != null)
             {
-                if (!pollingWaitTask.Wait(3000)) // timeout in ms
+                bool isPollingTask = Task.CurrentId.HasValue && pollingWaitTask.Id == Task.CurrentId.Value;
+                if (isPollingTask)
+                {
+                    SafeLog("Skipping polling task wait on polling thread.", LogLevel.Debug);
+                }
+                else if (!pollingWaitTask.Wait(3000)) // timeout in ms
                 {
                     SafeLog("Polling task did not complete within timeout - continuing disconnect.", LogLevel.Warning);
                 }
@@ -354,10 +363,15 @@ namespace Pulsar_DomeDriver.Driver
                 Thread.Sleep(_config.serialSettle); // Optional settle delay
             }
 
-            if (_mqttPublisher != null)
+            MqttPublisher publisher = null;
+            lock (_mqttLock)
             {
-                var publisher = _mqttPublisher;
+                publisher = _mqttPublisher;
                 _mqttPublisher = null;
+            }
+
+            if (publisher != null)
+            {
 
                 Task.Run(async () =>
                 {
@@ -600,19 +614,12 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
-        private struct PollingStartupSnapshot
-        {
-            public bool CommandInProgress;
-            public bool Rebooting;
-            public int PollingIntervalMs;
-            public int ControllerTimeout;
-        }
-
         public void StartPolling()
         {
-            SafeLog("StartPolling() invoked — launching polling loop", LogLevel.Info);
+            SafeLog("StartPolling() invoked - launching polling loop", LogLevel.Info);
 
-            PollingStartupSnapshot snapshot;
+            Task? pollingWaitTask = null;
+            int pollingWaitTimeoutMs = 0;
 
             lock (_pollingLock)
             {
@@ -637,6 +644,64 @@ namespace Pulsar_DomeDriver.Driver
                         SafeLog($"Polling task is stale (status: {_pollingTask.Status}). Resetting.", LogLevel.Debug);
                         _pollingTask = null;
                     }
+                    else
+                    {
+                        if (_pollingCancel != null && !_pollingCancel.IsCancellationRequested)
+                        {
+                            _pollingActive = true;
+                            SafeLog("Polling task already running. Resuming without restart.", LogLevel.Debug);
+                            return;
+                        }
+
+                        SafeLog("Polling task still running. Waiting for shutdown before restart.", LogLevel.Debug);
+                        pollingWaitTask = _pollingTask;
+                        pollingWaitTimeoutMs = _config.pollingIntervalMs * 2;
+                    }
+                }
+            }
+
+            if (pollingWaitTask != null)
+            {
+                try
+                {
+                    if (!pollingWaitTask.Wait(pollingWaitTimeoutMs))
+                    {
+                        SafeLog("Polling task did not exit within timeout - restart deferred.", LogLevel.Warning);
+                        return;
+                    }
+                }
+                catch (AggregateException ex)
+                {
+                    SafeLog($"Polling task wait failed: {ex.InnerException?.Message ?? ex.Message}", LogLevel.Warning);
+                }
+
+                lock (_pollingLock)
+                {
+                    if (_pollingTask == pollingWaitTask)
+                    {
+                        _pollingTask = null;
+                    }
+                }
+            }
+
+            lock (_pollingLock)
+            {
+                if (_config.CommandInProgress)
+                {
+                    SafeLog("Polling start blocked: command in progress.", LogLevel.Debug);
+                    return;
+                }
+
+                if (_pollingActive)
+                {
+                    SafeLog("Polling already active. Skipping restart.", LogLevel.Debug);
+                    return;
+                }
+
+                if (_pollingTask != null)
+                {
+                    SafeLog("Polling task already running. Skipping restart.", LogLevel.Debug);
+                    return;
                 }
 
                 SafeLog($"Starting polling with interval {_config.pollingIntervalMs} ms.", LogLevel.Debug);
@@ -647,18 +712,9 @@ namespace Pulsar_DomeDriver.Driver
 
                 _lastPollTimestamp = DateTime.UtcNow;
 
-                // ?? Capture atomic snapshot of startup flags
-                snapshot = new PollingStartupSnapshot
-                {
-                    CommandInProgress = _config.CommandInProgress,
-                    Rebooting = _config.Rebooting,
-                    PollingIntervalMs = _config.pollingIntervalMs,
-                    ControllerTimeout = _config.controllerTimeout
-                };
-
                 try
                 {
-                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token, snapshot));
+                    _pollingTask = Task.Run(() => PollLoopAsync(_pollingCancel.Token));
                     _pollingActive = true;
                 }
                 catch (Exception ex)
@@ -689,18 +745,17 @@ namespace Pulsar_DomeDriver.Driver
                 _pollingCancel?.Dispose();
                 _pollingCancel = null;
                 _pollingActive = false;
-                _config.CommandInProgress = false;
+                // CommandInProgress is cleared by SerialPortGuard.
                 //_config.Rebooting = false;
                 //_config.Resetting = false;
                 //***********************************************
-                _pollingTask = null;
 
                 SafeLog("Polling cancelled.", LogLevel.Debug);
                 return true;
             }
         }
 
-        private async Task PollLoopAsync(CancellationToken token, PollingStartupSnapshot startup)
+        private async Task PollLoopAsync(CancellationToken token)
         {
             if (_disposed) return;
 
@@ -713,20 +768,33 @@ namespace Pulsar_DomeDriver.Driver
                 // ?? Wait for readiness if command or reboot was active at launch
                 while (!_disposed && !token.IsCancellationRequested)
                 {
-                    if (!startup.CommandInProgress && !startup.Rebooting)
+                    bool commandInProgress;
+                    bool rebooting;
+                    int interval;
+                    int controllerTimeout;
+
+                    lock (_pollingLock)
+                    {
+                        commandInProgress = _config.CommandInProgress;
+                        rebooting = _config.Rebooting;
+                        interval = _config.pollingIntervalMs;
+                        controllerTimeout = _config.controllerTimeout;
+                    }
+
+                    if (!commandInProgress && !rebooting)
                         break;
 
                     if (startupWaitMs == 0)
                     {
-                        SafeLog($"Polling delayed: command={startup.CommandInProgress}, reboot={startup.Rebooting}. Waiting for readiness...", LogLevel.Debug);
+                        SafeLog($"Polling delayed: command={commandInProgress}, reboot={rebooting}. Waiting for readiness...", LogLevel.Debug);
                     }
 
-                    await Task.Delay(startup.PollingIntervalMs, token);
-                    startupWaitMs += startup.PollingIntervalMs;
+                    await Task.Delay(interval, token);
+                    startupWaitMs += interval;
 
-                    if (startupWaitMs >= startup.ControllerTimeout)
+                    if (startupWaitMs >= controllerTimeout)
                     {
-                        SafeLog("Polling startup timed out after 10s waiting for readiness. Exiting.", LogLevel.Warning);
+                        SafeLog($"Polling startup timed out after {controllerTimeout}ms waiting for readiness. Exiting.", LogLevel.Warning);
                         return;
                     }
                 }
@@ -753,7 +821,7 @@ namespace Pulsar_DomeDriver.Driver
                         try
                         {
                             _lastPollTimestamp = DateTime.UtcNow;
-                            SystemStatus(); // Safe outside lock
+                            SystemStatusInternal(token); // Safe outside lock
                             errorCount = 0;
 
                             // ?? Watchdog success coordination
@@ -765,7 +833,9 @@ namespace Pulsar_DomeDriver.Driver
                                 _actionWatchdog?.MarkSuccess();
                             if (_lastIntent == DomeCommandIntent.CloseShutter && _config.ShutterStatus == 1)
                                 _actionWatchdog?.MarkSuccess();
-                            else if (_lastIntent == DomeCommandIntent.SlewAzimuth && _config.DomeState == 0)
+                            else if (_lastIntent == DomeCommandIntent.SlewAzimuth &&
+                                _config.DomeState == 0 &&
+                                AngularDistance(_config.Azimuth, _config.SlewAz) <= _config.AzimuthTolerance)
                             {
                                 _actionWatchdog?.MarkSuccess();
                                 _lastIntent = DomeCommandIntent.None;
@@ -816,6 +886,13 @@ namespace Pulsar_DomeDriver.Driver
             }
             finally
             {
+                lock (_pollingLock)
+                {
+                    _pollingActive = false;
+                    if (_pollingTask?.Id == Task.CurrentId)
+                        _pollingTask = null;
+                }
+
                 SafeLog($"Polling thread exited cleanly. Last cancellation state: {token.IsCancellationRequested}, disposed={_disposed}", LogLevel.Debug);
             }
         }
@@ -891,22 +968,28 @@ namespace Pulsar_DomeDriver.Driver
                                 await Task.Delay(_systemWatchdogInterval, token);
                                 _lastWatchdogPing = DateTime.UtcNow;
                                 // ?? MQTT heartbeat
-                                if (_mqttPublisher?.IsConnected == true)
+                                if (_config.UseMQTT)
                                 {
-                                    string utcTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
-                                    string heartbeat = $"Alive at {utcTime}";
-                                    TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
-                                    AlarmHeartbeat();
-                                }
-                                else
-                                {
-                                    SafeLog("[Watchdog] MQTT not connected — heartbeat skipped", LogLevel.Warning);
+                                    if (_mqttPublisher?.IsConnected == true)
+                                    {
+                                        string utcTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
+                                        string heartbeat = $"Alive at {utcTime}";
+                                        TryMQTTPublish(_mqttWatchdog, $"{utcTime} :{domeOutputStatus}");
+                                        AlarmHeartbeat();
+                                    }
+                                    else if (_mqttPublisher != null)
+                                    {
+                                        SafeLog("[Watchdog] MQTT not connected - heartbeat skipped", LogLevel.Warning);
+                                    }
                                 }
 
                                 // ?? GNS heartbeat every 5 minutes (300 seconds)
-                                if ((DateTime.UtcNow - _lastGNSHeartbeat).TotalSeconds >= 300)
+                                bool commandActive = _config.ForceBusy ||
+                                    _config.ActionWatchdogRunning ||
+                                    (_lastIntent != DomeCommandIntent.None && !IsCommandComplete());
+                                if (!commandActive && (DateTime.UtcNow - _lastGNSHeartbeat).TotalSeconds >= 300)
                                 {
-                                    _GNS.SendGNS(GNSType.Message, $"Dome driver heartbeat: Azimuth {_config.Azimuth:F1}°, Shutter {_config.ShutterStatus}, Connected {_connected}");
+                                    _GNS.SendGNS(GNSType.Message, BuildGnsStatusMessage());
                                     _lastGNSHeartbeat = DateTime.UtcNow;
                                 }
 
@@ -1134,6 +1217,7 @@ namespace Pulsar_DomeDriver.Driver
             {
                 SafeLog("Resetting Alarm Monitor alarm", LogLevel.Info);
                 _alarmTriggered = false;
+                _allowMqttAlarm = false;
                 StopAlarmMonitor();
                 TryMQTTPublish(_mqttAlarm, "Off");
                 TryMQTTPublish(_mqttAlarmMessage, "");
@@ -1146,17 +1230,22 @@ namespace Pulsar_DomeDriver.Driver
             {
                 if (_alarmTriggered)
                 {
-                    // Already triggered — do nothing
+                    // Already triggered - do nothing
                     return;
                 }
 
                 _alarmTriggered = true;
 
+                string alarmMessage = message ?? "Dome driver alarm triggered";
+                if (!_allowMqttAlarm)
+                {
+                    SafeLog("Alarm triggered but MQTT alarm suppressed", LogLevel.Warning);
+                    return;
+                }
+
+                _GNS.SendGNS(GNSType.Alarm, alarmMessage);
                 TryMQTTPublish(_mqttAlarm, "On");
                 SafeLog("Alarm triggered: status 'On' published", LogLevel.Warning);
-
-                string alarmMessage = message ?? "Dome driver alarm triggered";
-                _GNS.SendGNS(GNSType.Alarm, alarmMessage);
 
                 if (!string.IsNullOrWhiteSpace(message))
                 {
@@ -1170,7 +1259,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             lock (_alarmLock)
             {
-                if (_alarmTriggered)
+                if (_alarmTriggered && _allowMqttAlarm)
                 {
                     TryMQTTPublish(_mqttAlarm, "On");
                 }
@@ -1181,12 +1270,33 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
+        private void PublishFinalAlarm(string message)
+        {
+            lock (_alarmLock)
+            {
+                _allowMqttAlarm = true;
+                _alarmTriggered = true;
+            }
+
+            _GNS.SendGNS(GNSType.Alarm, message);
+            TryMQTTPublish(_mqttAlarm, "On");
+            if (!string.IsNullOrWhiteSpace(message))
+            {
+                TryMQTTPublish(_mqttAlarmMessage, message);
+            }
+        }
+
 
         #endregion
 
         #region Pulsar Dome specific methods
 
         public void SystemStatus()
+        {
+            SystemStatusInternal(CancellationToken.None);
+        }
+
+        private void SystemStatusInternal(CancellationToken token)
         {
             if (_guard == null || !_guard.IsReady)
             {
@@ -1201,12 +1311,26 @@ namespace Pulsar_DomeDriver.Driver
                 ExponentialBackoff = false
             };
 
+            bool didAnyStatus = false;
+
             try
             {
                 retryPolicy.Execute(() =>
                 {
+                    if (token.IsCancellationRequested)
+                        return true;
+
                     bool domeOk = ParseDomeStatus();
+                    didAnyStatus = true;
+
+                    if (token.IsCancellationRequested)
+                        return true;
+
                     bool homeOk = ParseHomeStatus();
+
+                    if (token.IsCancellationRequested)
+                        return true;
+
                     bool parkOk = ParseParkStatus();
                     SlewingStatus();
 
@@ -1224,18 +1348,27 @@ namespace Pulsar_DomeDriver.Driver
 
                 }, isSuccess => isSuccess);
 
-                CompleteSystemStatus();
+                if (didAnyStatus)
+                {
+                    CompleteSystemStatus();
+                }
             }
             catch (TimeoutException ex)
             {
-                SafeLog($"[DomeStatus] Status check failed after retries — raising alarm: {ex.Message}", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, $"Dome status check failed after {_config.statusMaxRetries} retries");
+                if (token.IsCancellationRequested)
+                    return;
+
+                SafeLog($"[DomeStatus] Status check failed after retries - raising alarm: {ex.Message}", LogLevel.Error);
+                _GNS.SendGNS(GNSType.Message, $"Dome status check failed after {_config.statusMaxRetries} retries");
                 AlarmOn("Status check timeout");
             }
             catch (Exception ex)
             {
+                if (token.IsCancellationRequested)
+                    return;
+
                 SafeLog($"[DomeStatus] Unexpected error during status check: {ex}", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, $"Dome status check error: {ex.Message}");
+                _GNS.SendGNS(GNSType.Message, $"Dome status check error: {ex.Message}");
                 AlarmOn($"Status check error: {ex.Message}");
             }
         }
@@ -1464,12 +1597,18 @@ namespace Pulsar_DomeDriver.Driver
                 string trimmed = line.Trim();
                 if (trimmed == "1")
                 {
-                    _config.HomeStatus = true;
+                    lock (_pollingLock)
+                    {
+                        _config.HomeStatus = true;
+                    }
                     return true;
                 }
                 else if (trimmed == "0")
                 {
-                    _config.HomeStatus = false;
+                    lock (_pollingLock)
+                    {
+                        _config.HomeStatus = false;
+                    }
                     return true;
                 }
             }
@@ -1495,12 +1634,18 @@ namespace Pulsar_DomeDriver.Driver
                 string trimmed = line.Trim();
                 if (trimmed == "1")
                 {
-                    _config.ParkStatus = true;
+                    lock (_pollingLock)
+                    {
+                        _config.ParkStatus = true;
+                    }
                     return true;
                 }
                 else if (trimmed == "0")
                 {
-                    _config.ParkStatus = false;
+                    lock (_pollingLock)
+                    {
+                        _config.ParkStatus = false;
+                    }
                     return true;
                 }
             }
@@ -1511,23 +1656,53 @@ namespace Pulsar_DomeDriver.Driver
 
         public void SlewingStatus()
         {
-            bool forceBusy = _config.ForceBusy;
-
-            if (forceBusy)
+            if (_config.Resetting || _config.Rebooting)
             {
                 _config.SlewingStatus = true;
+                return;
             }
-            else
+
+            if (_lastIntent != DomeCommandIntent.None && !IsCommandComplete())
             {
-                bool isStationary;
-
-                lock (_pollingLock)
-                {
-                    isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
-                }
-
-                _config.SlewingStatus = !isStationary;
+                _config.SlewingStatus = true;
+                return;
             }
+
+            bool forceBusy = _config.ForceBusy || _config.ActionWatchdogRunning;
+
+            if (forceBusy || IsSlewGraceActive())
+            {
+                _config.SlewingStatus = true;
+                return;
+            }
+
+            bool isStationary;
+
+            lock (_pollingLock)
+            {
+                isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
+            }
+
+            _config.SlewingStatus = !isStationary;
+        }
+
+        private void SetSlewGracePeriod()
+        {
+            // Allow fast slews to be visible to clients that poll Slewing.
+            int graceMs = Math.Max(_config.pollingIntervalMs * 2, MinSlewGraceMs);
+            long untilTicks = DateTime.UtcNow.AddMilliseconds(graceMs).Ticks;
+            Interlocked.Exchange(ref _slewGraceUntilTicks, untilTicks);
+        }
+
+        private void ClearSlewGracePeriod()
+        {
+            Interlocked.Exchange(ref _slewGraceUntilTicks, 0);
+        }
+
+        private bool IsSlewGraceActive()
+        {
+            long untilTicks = Interlocked.Read(ref _slewGraceUntilTicks);
+            return untilTicks > 0 && DateTime.UtcNow.Ticks <= untilTicks;
         }
 
         private bool IsCommandComplete()
@@ -1536,12 +1711,26 @@ namespace Pulsar_DomeDriver.Driver
             {
                 DomeCommandIntent.GoHome => _config.DomeState == 0 && _config.HomeStatus,
                 DomeCommandIntent.SlewAzimuth => _config.DomeState == 0 &&
-                    Math.Abs(_config.TargetAzimuth - _config.SlewAz) <= _config.AzimuthTolerance,
+                    AngularDistance(_config.Azimuth, _config.SlewAz) <= _config.AzimuthTolerance,
                 DomeCommandIntent.OpenShutter => _config.ShutterStatus == 0,
                 DomeCommandIntent.CloseShutter => _config.ShutterStatus == 1,
                 DomeCommandIntent.Park => _config.DomeState == 0 && _config.ParkStatus,
                 _ => true
             };
+        }
+
+        private static double NormalizeAzimuth(double azimuth)
+        {
+            double normalized = azimuth % 360;
+            if (normalized < 0)
+                normalized += 360;
+            return normalized;
+        }
+
+        private static double AngularDistance(double a, double b)
+        {
+            double diff = Math.Abs(NormalizeAzimuth(a) - NormalizeAzimuth(b));
+            return diff > 180 ? 360 - diff : diff;
         }
 
         private void LogDomeStatus(string domeActivity, string shutterActivity)
@@ -1557,6 +1746,53 @@ namespace Pulsar_DomeDriver.Driver
                 SafeLog($"Shutter is: \t{shutterActivity}", LogLevel.Info);
                 oldShutterActivity = shutterActivity;
             }
+        }
+
+        private string BuildGnsStatusMessage()
+        {
+            string domeLine = BuildDomeStatusLine();
+            string shutterLine = BuildShutterStatusLine();
+            return $"{domeLine}{Environment.NewLine}{shutterLine}";
+        }
+
+        private string BuildDomeStatusLine()
+        {
+            if (_config.ParkStatus)
+                return "Dome = Parked";
+
+            if (_config.HomeStatus)
+                return "Dome = Home";
+
+            if (_config.DomeState == 9)
+                return "Dome = Finding home";
+
+            if (_config.DomeState == 1)
+            {
+                double targetAz = _config.TargetAzimuth;
+                if (_lastIntent == DomeCommandIntent.SlewAzimuth && !IsCommandComplete())
+                    targetAz = _config.SlewAz;
+
+                double normalizedTarget = NormalizeAzimuth(targetAz);
+                return $"Dome = Slewing to az {normalizedTarget:0}";
+            }
+
+            return $"Dome = az {_config.Azimuth:0}";
+        }
+
+        private string BuildShutterStatusLine()
+        {
+            string shutterStatus = _config.ShutterStatus switch
+            {
+                0 => "Open",
+                1 => "Closed",
+                2 => "Opening",
+                3 => "Closing",
+                4 => "Error",
+                5 => "Unknown",
+                _ => "Invalid status"
+            };
+
+            return $"Shutter = {shutterStatus}";
         }
 
         public class RetryPolicy
@@ -1649,8 +1885,8 @@ namespace Pulsar_DomeDriver.Driver
 
                 if (_config.SystemWatchdogRunning)
                 {
-                    SafeLog("Watchdog did not exit after cancellation — aborting reset.", LogLevel.Error);
-                    _GNS.SendGNS(GNSType.Alarm, "Reset aborted: watchdog failed to exit after cancellation.");
+                    SafeLog("Watchdog did not exit after cancellation - aborting reset.", LogLevel.Error);
+                    _GNS.SendGNS(GNSType.Message, "Reset aborted: watchdog failed to exit after cancellation.");
                     lock (_resetLock) { _config.Resetting = false; }
                     return;
                 }
@@ -1658,7 +1894,7 @@ namespace Pulsar_DomeDriver.Driver
             catch (Exception ex)
             {
                 SafeLog($"Unexpected error while waiting for watchdog: {ex.Message}", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, "Reset aborted due to watchdog coordination error.");
+                _GNS.SendGNS(GNSType.Message, "Reset aborted due to watchdog coordination error.");
                 lock (_resetLock) { _config.Resetting = false; }
                 return;
             }
@@ -1702,6 +1938,8 @@ namespace Pulsar_DomeDriver.Driver
                             SafeLog("Soft reset completed successfully.", LogLevel.Info);
                             _GNS.SendGNS(GNSType.Message, "Soft reset completed successfully.");
 
+                            RearmResetFlagsAfterSuccess();
+
                             lock (_pollingLock)
                             {
                                 _config.SlewingStatus = false;
@@ -1712,7 +1950,7 @@ namespace Pulsar_DomeDriver.Driver
                             Thread.Sleep(_config.serialSettle);
                             await Task.Delay(_config.serialSettle * 4);
 
-                            _ = Task.Run(ReplayLastCommand);
+                            ReplayLastCommand(allowDuringReset: true);
                             return;
                         }
 
@@ -1724,55 +1962,77 @@ namespace Pulsar_DomeDriver.Driver
                     }
                 }
 
-                if ((_config.HardReset || hardOnly) && !_config.HardResetAttempted)
+                int hardResetAttempts = 0;
+                const int maxHardResetAttempts = 2;
+
+                if (_config.HardReset || hardOnly)
                 {
-                    SafeLog("Performing hard hardware reset.", LogLevel.Warning);
-                    _config.HardResetAttempted = true;
-                    _config.HardResetSuccess = false;
-
-                    try
+                    while (hardResetAttempts < maxHardResetAttempts)
                     {
-                        _config.HardResetSuccess = await HardwareReset("hard");
+                        hardResetAttempts++;
+                        SafeLog($"Performing hard hardware reset (attempt {hardResetAttempts} of {maxHardResetAttempts}).", LogLevel.Warning);
+                        _config.HardResetAttempted = true;
+                        _config.HardResetSuccess = false;
 
-                        bool proceed;
-                        lock (_resetLock)
+                        try
                         {
-                            proceed = _config.HardResetSuccess && !_config.Rebooting;
-                        }
+                            _config.HardResetSuccess = await HardwareReset("hard");
 
-                        if (proceed)
+                            bool proceed;
+                            lock (_resetLock)
+                            {
+                                proceed = _config.HardResetSuccess && !_config.Rebooting;
+                            }
+
+                            if (proceed)
+                            {
+                                SafeLog("Hard reset completed successfully.", LogLevel.Info);
+                                _GNS.SendGNS(GNSType.Message, "Hard reset completed successfully.");
+
+                                StartPolling();
+                                Thread.Sleep(60);
+                                bool replayOk = ReplayLastCommand(allowDuringReset: true);
+
+                                if (replayOk)
+                                {
+                                    RearmResetFlagsAfterSuccess();
+                                    return;
+                                }
+
+                                SafeLog($"Replay failed after hard reset attempt {hardResetAttempts}.", LogLevel.Warning);
+                                if (hardResetAttempts < maxHardResetAttempts)
+                                {
+                                    StopPolling(force: true);
+                                    continue;
+                                }
+
+                                string replayFail = $"Replay failed after second hard reset attempt for {_lastIntent}";
+                                SafeLog(replayFail, LogLevel.Error);
+                                PublishFinalAlarm(replayFail);
+                                return;
+                            }
+
+                            SafeLog("Hard reset failed or rebooting still active.", LogLevel.Info);
+                        }
+                        catch (Exception ex)
                         {
-                            SafeLog("Hard reset completed successfully.", LogLevel.Info);
-                            _GNS.SendGNS(GNSType.Message, "Hard reset completed successfully.");
-
-                            StartPolling();
-                            Thread.Sleep(60);
-                            _ = Task.Run(ReplayLastCommand);
-                            return;
+                            SafeLog($"Hard reset failed: {ex.Message}", LogLevel.Error);
                         }
-
-                        SafeLog("Hard reset failed or rebooting still active.", LogLevel.Info);
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeLog($"Hard reset failed: {ex.Message}", LogLevel.Error);
                     }
                 }
 
-                if (_config.HardResetAttempted && !_config.HardResetSuccess)
+                if (hardResetAttempts >= maxHardResetAttempts)
                 {
-                    string failMessage = $"Unrecoverable failure after hard reset for {_lastIntent}";
+                    string failMessage = $"Second hard reset failed for {_lastIntent}";
                     SafeLog(failMessage, LogLevel.Error);
-                    _GNS.SendGNS(GNSType.Alarm, failMessage);
-                    TryMQTTPublish(_mqttAlarm, failMessage);
+                    PublishFinalAlarm(failMessage);
                 }
             }
             catch (Exception ex)
             {
                 string exMessage = $"ResetRoutine encountered unexpected error: {ex.Message}";
                 SafeLog(exMessage, LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, exMessage);
-                TryMQTTPublish(_mqttAlarm, exMessage);
+                _GNS.SendGNS(GNSType.Message, exMessage);
             }
             finally
             {
@@ -1781,6 +2041,12 @@ namespace Pulsar_DomeDriver.Driver
                     _config.Resetting = false;
                 }
             }
+        }
+
+        private void RearmResetFlagsAfterSuccess()
+        {
+            _config.SoftResetAttempted = false;
+            _config.HardResetAttempted = false;
         }
 
         public async Task<bool> HardwareReset(string type)
@@ -2000,40 +2266,41 @@ namespace Pulsar_DomeDriver.Driver
             }
         }
 
-        private void ReplayLastCommand()
+        private bool ReplayLastCommand(bool allowDuringReset)
         {
 
             SafeLog($"Replaying last intent after reset: {_lastIntent}", LogLevel.Info);
 
             if (_lastIntent == DomeCommandIntent.None)
-                return;
+                return true;
             try
             {
                 switch (_lastIntent)
                 {
                     case DomeCommandIntent.CloseShutter:
-                        CloseShutter();
-                        break;
+                        CloseShutterInternal(allowDuringReset);
+                        return true;
                     case DomeCommandIntent.OpenShutter:
-                        OpenShutter();
-                        break;
+                        OpenShutterInternal(allowDuringReset);
+                        return true;
                     case DomeCommandIntent.GoHome:
-                        FindHome();
-                        break;
+                        FindHomeInternal(allowDuringReset);
+                        return true;
                     case DomeCommandIntent.Park:
-                        Park();
-                        break;
+                        ParkInternal(allowDuringReset);
+                        return true;
                     case DomeCommandIntent.SlewAzimuth:
-                        SlewToAzimuth(_config.SlewAz);
-                        break;
+                        SlewToAzimuthInternal(_config.SlewAz, allowDuringReset);
+                        return true;
                     default:
                         SafeLog($"No replay logic defined for intent: {_lastIntent}", LogLevel.Error);
-                        break;
+                        return false;
                 }
             }
             catch (Exception ex)
             {
                 SafeLog($"Replay of intent {_lastIntent} failed: {ex.Message}", LogLevel.Error);
+                return false;
             }
         }
 
@@ -2082,30 +2349,39 @@ namespace Pulsar_DomeDriver.Driver
 
             try
             {
-                if (_mqttPublisher != null)
+                MqttPublisher publisher;
+                lock (_mqttLock)
                 {
-                    try { _mqttPublisher.Dispose(); } catch { }
-                    _mqttPublisher = null;
-                }
+                    if (_mqttPublisher != null)
+                    {
+                        try { _mqttPublisher.Dispose(); } catch { }
+                        _mqttPublisher = null;
+                    }
 
-                _mqttPublisher = new MqttPublisher(_logger, _config);
+                    publisher = new MqttPublisher(_logger, _config);
+                    _mqttPublisher = publisher;
+                }
                 SafeLog("MqttPublisher instance created", LogLevel.Debug);
 
                 string mqttIp = _config.MQTTip;
                 string mqttPort = _config.MQTTport;
                 SafeLog($"Initializing MQTT connection to {mqttIp}:{mqttPort}", LogLevel.Info);
-                await _mqttPublisher.InitializeAsync(mqttIp, mqttPort);
+                await publisher.InitializeAsync(mqttIp, mqttPort);
 
                 // Wait for connection with timeout
-                var connectedTask = _mqttPublisher.WaitForConnectedAsync();
+                var connectedTask = publisher.WaitForConnectedAsync();
                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
                 var completedTask = await Task.WhenAny(connectedTask, timeoutTask);
                 
-                if (completedTask == timeoutTask || _mqttPublisher.IsConnected == false)
+                if (completedTask == timeoutTask || publisher.IsConnected == false)
                 {
                     SafeLog("MQTT connection timeout", LogLevel.Error);
-                    try { _mqttPublisher.Dispose(); } catch { }
-                    _mqttPublisher = null;
+                    try { publisher.Dispose(); } catch { }
+                    lock (_mqttLock)
+                    {
+                        if (_mqttPublisher == publisher)
+                            _mqttPublisher = null;
+                    }
                     return false;
                 }
 
@@ -2120,8 +2396,11 @@ namespace Pulsar_DomeDriver.Driver
             catch (Exception ex)
             {
                 SafeLog($"StartMQTTAsync failed: {ex}", LogLevel.Error);
-                try { _mqttPublisher?.Dispose(); } catch { }
-                _mqttPublisher = null;
+                lock (_mqttLock)
+                {
+                    try { _mqttPublisher?.Dispose(); } catch { }
+                    _mqttPublisher = null;
+                }
                 return false;
             }
         }
@@ -2141,6 +2420,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void TryMQTTPublish(string topic, string message)
         {
+            MqttPublisher publisher;
             lock (_mqttLock)
             {
                 if (_config.Rebooting)
@@ -2148,15 +2428,17 @@ namespace Pulsar_DomeDriver.Driver
                     SafeLog($"[TryMQTTPublish] Skipped - Rebooting is true", LogLevel.Debug);
                     return;
                 }
+
+                publisher = _mqttPublisher;
             }
 
-            if (_mqttPublisher == null)
+            if (publisher == null)
             {
                 SafeLog($"[TryMQTTPublish] Skipped - publisher is null", LogLevel.Debug);
                 return;
             }
 
-            if (!_mqttPublisher.IsConnected)
+            if (!publisher.IsConnected)
             {
                 SafeLog($"[TryMQTTPublish] Skipped - not connected", LogLevel.Debug);
                 return;
@@ -2168,7 +2450,23 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
-            _ = _mqttPublisher.PublishAsync(topic, message);
+            _ = PublishMqttSafely(publisher, topic, message);
+        }
+
+        private async Task PublishMqttSafely(MqttPublisher publisher, string topic, string message)
+        {
+            try
+            {
+                await publisher.PublishAsync(topic, message);
+            }
+            catch (ObjectDisposedException)
+            {
+                SafeLog("[TryMQTTPublish] Publisher disposed during publish.", LogLevel.Debug);
+            }
+            catch (Exception ex)
+            {
+                SafeLog($"[TryMQTTPublish] Publish failed: {ex.Message}", LogLevel.Debug);
+            }
         }
 
         #endregion
@@ -2389,8 +2687,11 @@ namespace Pulsar_DomeDriver.Driver
                     _pollingCancel = null;
                 }, "PollingCancel");
 
+                SafeDispose(() => _commandGate.Dispose(), "CommandGate");
+
                 SafeDispose(() => SafeLog("Driver disposed.", LogLevel.Info), "Logger.Log");
                 SafeDispose(() => _GNS.SendGNS(GNSType.Message, "Dome driver disposed"), "GNS.Message");
+                SafeDispose(() => _GNS?.Dispose(), "GNS.Dispose");
                 SafeDispose(() => _logger?.Dispose(), "Logger.Dispose");
             }
 
@@ -2408,15 +2709,21 @@ namespace Pulsar_DomeDriver.Driver
         {
             try
             {
-                if (_mqttPublisher != null)
+                MqttPublisher publisher = null;
+                lock (_mqttLock)
                 {
-                    if (_mqttPublisher.IsConnected)
-                    {
-                        _mqttPublisher.DisconnectAsync().GetAwaiter().GetResult();
-                    }
-                    _mqttPublisher.Dispose();
+                    publisher = _mqttPublisher;
                     _mqttPublisher = null;
                 }
+
+                if (publisher == null)
+                    return;
+
+                if (publisher.IsConnected)
+                {
+                    publisher.DisconnectAsync().GetAwaiter().GetResult();
+                }
+                publisher.Dispose();
             }
             catch
             {
@@ -2521,9 +2828,18 @@ namespace Pulsar_DomeDriver.Driver
         {
             get
             {
+                if (_config.Resetting || _config.Rebooting)
+                    return true;
+
+                if (_lastIntent != DomeCommandIntent.None && !IsCommandComplete())
+                    return true;
+
+                if (IsSlewGraceActive() || _config.ForceBusy || _config.ActionWatchdogRunning)
+                    return true;
+
                 lock (_pollingLock)
                 {
-                    return _config.SlewingStatus;
+                    return !(_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
                 }
             }
         }
@@ -2532,54 +2848,112 @@ namespace Pulsar_DomeDriver.Driver
 
         #region Ascom Action helpers
 
-        private void ExecuteDomeCommand(
-string command,
-string message,
-int timeoutMs,
-DomeCommandIntent intent,
-Func<bool> alreadyAtTarget,
-Action updateConfigBeforeWatchdog,
-Func<ActionWatchdog.WatchdogResult> checkStatus,
-string mqttTopic,
-string mqttSuccess,
-string mqttFail,
-string actionLabel,
-string longAction,
-string? gnsOverride = null,
-double? gnsTimeoutFactor = null)
+        private void EnterCommandGate(string actionLabel)
         {
-            PrepareCommandExecution(message, gnsOverride, gnsTimeoutFactor, timeoutMs, intent);
+            SafeLog($"Waiting for command gate: {actionLabel}", LogLevel.Debug);
+            _commandGate.Wait();
+            SafeLog($"Command gate acquired: {actionLabel}", LogLevel.Trace);
+        }
 
+        private void ExitCommandGate(string actionLabel)
+        {
             try
             {
-                if (!TrySendCommand(command, intent, alreadyAtTarget, actionLabel))
-                    return;
-
-                lock (_pollingLock)
-                {
-                    updateConfigBeforeWatchdog();
-                }
-
-                if (!WaitForControllerReady(actionLabel))
-                    return;
-
-                LaunchActionWatchdog(
-                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
-                    action: actionLabel,
-                    longAction: longAction,
-                    checkStatus: checkStatus,
-                    mqttTopic: mqttTopic,
-                    mqttSuccess: mqttSuccess,
-                    mqttFail: mqttFail
-                );
+                _commandGate.Release();
+                SafeLog($"Command gate released: {actionLabel}", LogLevel.Trace);
             }
-            catch (Exception ex)
+            catch (SemaphoreFullException)
             {
-                SafeLog($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+                SafeLog($"Command gate release skipped for {actionLabel}.", LogLevel.Warning);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Ignore during shutdown.
+            }
+        }
+
+        private void EnsureReadyForCommand(string actionLabel, bool allowDuringReset)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(DomeDriver));
+
+            if (_config.Rebooting)
+            {
+                SafeLog($"{actionLabel} blocked: reboot in progress.", LogLevel.Warning);
+                throw new System.InvalidOperationException($"{actionLabel} blocked: reboot in progress.");
+            }
+
+            if (_config.Resetting && !allowDuringReset)
+            {
+                SafeLog($"{actionLabel} blocked: reset/reboot in progress.", LogLevel.Warning);
+                throw new System.InvalidOperationException($"{actionLabel} blocked: reset/reboot in progress.");
+            }
+
+            if (!allowDuringReset && Slewing)
+            {
+                SafeLog($"{actionLabel} blocked: driver busy.", LogLevel.Warning);
+                throw new System.InvalidOperationException($"{actionLabel} blocked: driver busy.");
+            }
+        }
+
+        private void ExecuteDomeCommand(
+ string command,
+ string message,
+ int timeoutMs,
+ DomeCommandIntent intent,
+ Func<bool> alreadyAtTarget,
+ Action updateConfigBeforeWatchdog,
+ Func<ActionWatchdog.WatchdogResult> checkStatus,
+ string mqttTopic,
+ string mqttSuccess,
+ string mqttFail,
+ string actionLabel,
+ string longAction,
+ string? gnsOverride = null,
+ double? gnsTimeoutFactor = null,
+ bool allowDuringReset = false)
+        {
+            EnterCommandGate(actionLabel);
+            try
+            {
+                EnsureReadyForCommand(actionLabel, allowDuringReset);
+                PrepareCommandExecution(message, gnsOverride, gnsTimeoutFactor, timeoutMs, intent);
+
+                try
+                {
+                    if (!TrySendCommand(command, intent, alreadyAtTarget, actionLabel))
+                        return;
+
+                    lock (_pollingLock)
+                    {
+                        updateConfigBeforeWatchdog();
+                    }
+
+                    if (!WaitForControllerReady(actionLabel))
+                        return;
+
+                    LaunchActionWatchdog(
+                        timeout: TimeSpan.FromMilliseconds(timeoutMs),
+                        action: actionLabel,
+                        longAction: longAction,
+                        checkStatus: checkStatus,
+                        mqttTopic: mqttTopic,
+                        mqttSuccess: mqttSuccess,
+                        mqttFail: mqttFail
+                    );
+                }
+                catch (Exception ex)
+                {
+                    SafeLog($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+                }
+                finally
+                {
+                    StartPolling();
+                }
             }
             finally
             {
-                StartPolling();
+                ExitCommandGate(actionLabel);
             }
         }
 
@@ -2596,9 +2970,32 @@ double? gnsTimeoutFactor = null)
             }
 
             bool pollingWasStopped = StopPolling();
+            if (!pollingWasStopped)
+            {
+                SafeLog("Polling stop deferred due to in-flight command. Forcing stop for command execution.", LogLevel.Debug);
+                pollingWasStopped = StopPolling(force: true);
+            }
             if (pollingWasStopped)
             {
-                _pollingTask?.Wait(_config.pollingIntervalMs * 2);
+                try
+                {
+                    if (_pollingTask != null)
+                    {
+                        bool isPollingTask = Task.CurrentId.HasValue && _pollingTask.Id == Task.CurrentId.Value;
+                        if (isPollingTask)
+                        {
+                            SafeLog("Skipping polling task wait on polling thread.", LogLevel.Debug);
+                        }
+                        else
+                        {
+                            _pollingTask.Wait(_config.pollingIntervalMs * 2);
+                        }
+                    }
+                }
+                catch (AggregateException ex)
+                {
+                    SafeLog($"Polling task wait error: {ex.InnerException?.Message ?? ex.Message}", LogLevel.Debug);
+                }
                 Thread.Sleep(60);
             }
         }
@@ -2631,6 +3028,18 @@ double? gnsTimeoutFactor = null)
             while (!_config.ControllerReady && waitMs < _config.controllerTimeout)
             {
                 SafeLog($"[WaitForControllerReady] ControllerReady={_config.ControllerReady}, waited={waitMs} ms", LogLevel.Trace);
+                try
+                {
+                    SystemStatus();
+                }
+                catch (Exception ex)
+                {
+                    SafeLog($"[WaitForControllerReady] Status refresh failed: {ex.Message}", LogLevel.Debug);
+                }
+
+                if (_config.ControllerReady)
+                    break;
+
                 Thread.Sleep(_config.pollingIntervalMs);
                 waitMs += _config.pollingIntervalMs;
             }
@@ -2706,8 +3115,7 @@ double? gnsTimeoutFactor = null)
         // Centralize: raise alarm via GNS + MQTT and kick off reset
         private void RaiseAlarmAndReset(string alarmMessage)
         {
-            _GNS.SendGNS(GNSType.Alarm, alarmMessage);
-            TryMQTTPublish(_mqttAlarm, alarmMessage);
+            _GNS.SendGNS(GNSType.Message, alarmMessage);
             SafeLog($"[ALARM] {alarmMessage}", LogLevel.Error);
             _config.ForceBusy = true;
             _ = Task.Run(async () => await ResetRoutineAsync());
@@ -2719,18 +3127,25 @@ double? gnsTimeoutFactor = null)
 
         public void OpenShutter()
         {
-            string message = "Opening shutter...";
+            OpenShutterInternal(allowDuringReset: false);
+        }
+
+        private void OpenShutterInternal(bool allowDuringReset)
+        {
+            string message = "Shutter opening...";
+            int timeoutMs = _config.ShutterTimeout * 1000;
+            double gnsTimeoutFactor = 600.0 / Math.Max(1.0, timeoutMs / 1000.0);
             LogShutter(message);
 
             ExecuteDomeCommand(
                 command: "OPEN",
                 message: message,
-                timeoutMs: _config.ShutterTimeout * 1000,
+                timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.OpenShutter,
                 alreadyAtTarget: () => _config.ShutterStatus == 0,
                 updateConfigBeforeWatchdog: () =>
                 {
-                    _config.ShutterStatus = 1; // opening
+                    _config.ShutterStatus = 2; // opening
                     _config.SlewingStatus = true;
                 },
                 checkStatus: () => _config.ShutterStatus switch
@@ -2744,19 +3159,29 @@ double? gnsTimeoutFactor = null)
                 mqttSuccess: "Shutter is open.",
                 mqttFail: "Shutter failed to open.",
                 actionLabel: "open shutter",
-                longAction: "Shutter opening..."
+                longAction: "Shutter opening...",
+                gnsOverride: message,
+                gnsTimeoutFactor: gnsTimeoutFactor,
+                allowDuringReset: allowDuringReset
             );
         }
 
         public void CloseShutter()
         {
+            CloseShutterInternal(allowDuringReset: false);
+        }
+
+        private void CloseShutterInternal(bool allowDuringReset)
+        {
             string message = "Closing shutter...";
+            int timeoutMs = _config.ShutterTimeout * 1000;
+            double gnsTimeoutFactor = 600.0 / Math.Max(1.0, timeoutMs / 1000.0);
             LogShutter(message);
 
             ExecuteDomeCommand(
                 command: "CLOSE",
                 message: message,
-                timeoutMs: _config.ShutterTimeout * 1000,
+                timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.CloseShutter,
                 alreadyAtTarget: () => _config.ShutterStatus == 1,
                 updateConfigBeforeWatchdog: () =>
@@ -2775,37 +3200,51 @@ double? gnsTimeoutFactor = null)
                 mqttSuccess: "Shutter closed.",
                 mqttFail: "Shutter failed to close.",
                 actionLabel: "Close shutter",
-                longAction: "Shutter closing..."
+                longAction: "Shutter closing...",
+                gnsOverride: message,
+                gnsTimeoutFactor: gnsTimeoutFactor,
+                allowDuringReset: allowDuringReset
             );
         }
 
         public void SlewToAzimuth(double azimuth)
         {
-            if (azimuth < 0 || azimuth >= 360)
-                throw new InvalidValueException($"Invalid Azimuth request of {azimuth} — must be between 0 and less than 360 degrees.");
+            SlewToAzimuthInternal(azimuth, allowDuringReset: false);
+        }
 
-            changeAzimuth = Math.Abs(azimuth - _config.Azimuth);
+        private void SlewToAzimuthInternal(double azimuth, bool allowDuringReset)
+        {
+            if (azimuth < 0 || azimuth >= 360)
+                throw new InvalidValueException($"Invalid Azimuth request of {azimuth} - must be between 0 and less than 360 degrees.");
+
+            changeAzimuth = AngularDistance(azimuth, _config.Azimuth);
             string message = $"Slewing to {azimuth}...";
             string command = $"ABS {azimuth}";
             LogDome(message);
+
+            lock (_pollingLock)
+            {
+                _config.SlewAz = azimuth;
+            }
 
             ExecuteDomeCommand(
                 command: command,
                 message: message,
                 timeoutMs: _config.RotationTimeout * 1000,
                 intent: DomeCommandIntent.SlewAzimuth,
-                alreadyAtTarget: () => Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance,
+                alreadyAtTarget: () => AngularDistance(_config.Azimuth, azimuth) < _config.AzimuthTolerance,
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.DomeState = 1;
                     _config.SlewingStatus = true;
+                    SetSlewGracePeriod();
                 },
                 checkStatus: () =>
                 {
-                    if (_config.DomeState == 0 && Math.Abs(_config.Azimuth - azimuth) < _config.AzimuthTolerance)
+                    if (_config.DomeState == 0 && AngularDistance(_config.Azimuth, azimuth) < _config.AzimuthTolerance)
                         return ActionWatchdog.WatchdogResult.Success;
 
-                    if (_config.DomeState == 1 || Math.Abs(_config.Azimuth - azimuth) >= _config.AzimuthTolerance)
+                    if (_config.DomeState == 1 || AngularDistance(_config.Azimuth, azimuth) >= _config.AzimuthTolerance)
                         return ActionWatchdog.WatchdogResult.InProgress;
 
                     return ActionWatchdog.WatchdogResult.Failure;
@@ -2816,11 +3255,17 @@ double? gnsTimeoutFactor = null)
                 actionLabel: "goto azimuth",
                 longAction: $"Slewing to {azimuth}...",
                 gnsOverride: changeAzimuth > _config.JogSize ? message : null,
-                gnsTimeoutFactor: changeAzimuth > _config.JogSize ? 2.5 : null
+                gnsTimeoutFactor: changeAzimuth > _config.JogSize ? 2.5 : null,
+                allowDuringReset: allowDuringReset
             );
         }
 
         public void FindHome()
+        {
+            FindHomeInternal(allowDuringReset: false);
+        }
+
+        private void FindHomeInternal(bool allowDuringReset)
         {
             string message = "Finding Home...";
             int timeoutMs = _config.RotationTimeout * 1000;
@@ -2849,11 +3294,17 @@ double? gnsTimeoutFactor = null)
                 actionLabel: "home",
                 longAction: "Finding home...",
                 gnsOverride: message,
-                gnsTimeoutFactor: 2.5
+                gnsTimeoutFactor: 2.5,
+                allowDuringReset: allowDuringReset
             );
         }
 
         public void Park()
+        {
+            ParkInternal(allowDuringReset: false);
+        }
+
+        private void ParkInternal(bool allowDuringReset)
         {
             string message = "Parking...";
             int timeoutMs = _config.RotationTimeout * 1000;
@@ -2882,7 +3333,8 @@ double? gnsTimeoutFactor = null)
                 actionLabel: "Park",
                 longAction: "Parking...",
                 gnsOverride: message,
-                gnsTimeoutFactor: 2.5
+                gnsTimeoutFactor: 2.5,
+                allowDuringReset: allowDuringReset
             );
         }
 
@@ -2916,6 +3368,7 @@ double? gnsTimeoutFactor = null)
                     {
                         _config.SlewingStatus = false; // let poller confirm DomeState
                     }
+                    ClearSlewGracePeriod();
 
                     CancelCurrentActionWatchdog();
 
@@ -2928,8 +3381,7 @@ double? gnsTimeoutFactor = null)
                 else
                 {
                     SafeLog("Abort STOP failed (no ACK). Initiating recovery.", LogLevel.Error);
-                    _GNS.SendGNS(GNSType.Alarm, "Abort failed (no ACK). Resetting controller.");
-                    TryMQTTPublish(_mqttAlarm, "Alarm");
+                    _GNS.SendGNS(GNSType.Message, "Abort failed (no ACK). Resetting controller.");
 
                     _config.ForceBusy = true;
 
@@ -2949,8 +3401,7 @@ double? gnsTimeoutFactor = null)
             catch (Exception ex)
             {
                 SafeLog($"Abort command error: {ex.Message}", LogLevel.Error);
-                _GNS.SendGNS(GNSType.Alarm, "Abort threw an exception. Resetting controller.");
-                TryMQTTPublish(_mqttAlarm, "Alarm");
+                _GNS.SendGNS(GNSType.Message, "Abort threw an exception. Resetting controller.");
 
                 _config.ForceBusy = true;
 

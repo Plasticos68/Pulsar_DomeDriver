@@ -85,7 +85,7 @@ namespace Pulsar_DomeDriver.Helper
                         }
                     }
 
-                    // 🧠 Final settle delay to catch in-flight USB data
+                    // Final settle delay to catch in-flight USB data
                     Thread.Sleep(100);
 
                     _port.DiscardOutBuffer();

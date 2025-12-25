@@ -97,6 +97,15 @@ namespace Pulsar_DomeDriver.UI
 
         private void btnOK_Click(object sender, EventArgs e)
         {
+            if (!TryReadInt(txtBoxResetDelay, "Reboot Delay (s)", 0, null, out int resetDelay))
+                return;
+            if (!TryReadInt(txtBoxShutterTimeout, "Shutter Timeout (s)", 10, 600, out int shutterTimeout))
+                return;
+            if (!TryReadInt(txtBoxRotationTimeout, "Rotation Timeout (s)", 10, 600, out int rotationTimeout))
+                return;
+            if (!TryReadInt(txtBoxCycleDelay, "Cycle Delay (s)", 0, null, out int cycleDelay))
+                return;
+
             _config.SerialPort = comboBoxSerialPort.Text;
             _config.LogLocation = txtBoxLogLocation.Text;
             _config.DebugLog = chkBoxDebugLog.Checked;
@@ -124,22 +133,10 @@ namespace Pulsar_DomeDriver.UI
                 _config.MQTTport = txtBoxMQTTport.Text;
             }
 
-            if (int.TryParse(txtBoxResetDelay.Text, out int resetDelay))
-            {
-                _config.ResetDelay = (resetDelay);
-            }
-            if (int.TryParse(txtBoxShutterTimeout.Text, out int shutterTimeout))
-            {
-                _config.ShutterTimeout = (shutterTimeout);
-            }
-            if (int.TryParse(txtBoxRotationTimeout.Text, out int rotationTimeout))
-            {
-                _config.RotationTimeout = (rotationTimeout);
-            }
-            if (int.TryParse(txtBoxCycleDelay.Text, out int cycleDelay))
-            {
-                _config.CycleDelay = (cycleDelay);
-            }
+            _config.ResetDelay = resetDelay;
+            _config.ShutterTimeout = shutterTimeout;
+            _config.RotationTimeout = rotationTimeout;
+            _config.CycleDelay = cycleDelay;
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -330,6 +327,35 @@ namespace Pulsar_DomeDriver.UI
             
             txtBoxMQTTip.Enabled = !chkBoxUseLocalhost.Checked;
             txtBoxMQTTport.Enabled = !chkBoxUseLocalhost.Checked;
+        }
+
+        private bool TryReadInt(TextBox textBox, string fieldName, int? minValue, int? maxValue, out int value)
+        {
+            if (!int.TryParse(textBox.Text, out value))
+            {
+                MessageBox.Show($"{fieldName} must be a whole number.", "Invalid value", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                textBox.Focus();
+                textBox.SelectAll();
+                return false;
+            }
+
+            if (minValue.HasValue && value < minValue.Value)
+            {
+                MessageBox.Show($"{fieldName} must be at least {minValue.Value}.", "Invalid value", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                textBox.Focus();
+                textBox.SelectAll();
+                return false;
+            }
+
+            if (maxValue.HasValue && value > maxValue.Value)
+            {
+                MessageBox.Show($"{fieldName} must be at most {maxValue.Value}.", "Invalid value", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                textBox.Focus();
+                textBox.SelectAll();
+                return false;
+            }
+
+            return true;
         }
     }
 }

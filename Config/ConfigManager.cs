@@ -50,11 +50,12 @@ namespace Pulsar_DomeDriver.Config
         {
             try
             {
-                return _profile.GetValue(_driverId, name, defaultValue) ?? defaultValue;
+                var value = _profile.GetValue(_driverId, name, "", defaultValue);
+                return value ?? defaultValue;
             }
             catch (ASCOM.Utilities.Exceptions.DriverNotRegisteredException)
             {
-                return _profile.GetValue(_driverId + "." + name, defaultValue) ?? defaultValue;
+                return defaultValue;
             }
         }
 

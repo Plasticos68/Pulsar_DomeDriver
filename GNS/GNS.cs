@@ -84,8 +84,6 @@ namespace Pulsar_DomeDriver.Goodnight
             }
         }
 
-
-
         private void SafeLog(string message, LogLevel level)
         {
             if (_disposed) return;
