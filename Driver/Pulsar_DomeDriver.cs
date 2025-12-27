@@ -27,9 +27,14 @@ namespace Pulsar_DomeDriver.Driver
     [Guid("5096766c-f998-42bd-a22d-8f0a00ed4b51")]
     [ProgId("Pulsar_DomeDriver")]
 
+    /// <summary>
+    /// ASCOM dome driver for the Pulsar controller. Coordinates serial I/O, polling,
+    /// watchdogs, and optional MQTT/GNS notifications.
+    /// </summary>
     public class DomeDriver : IDomeV2
     {
         #region Class setup
+        // Core dependencies and lifetime-owned resources.
         private Profile _profile;
         private FileLogger _logger;
         private ConfigManager _config;
@@ -38,12 +43,12 @@ namespace Pulsar_DomeDriver.Driver
         private EventHandler? _processExitHandler;
         private EventHandler? _domainUnloadHandler;
 
-        // connection
+        // Connection state and protocol response tokens.
         private bool _connected = false;
         private readonly string _pingResponse = "Y519";
         private readonly string _generalResponse = "A";
 
-        // extras
+        // Shared locks and gate used to coordinate multi-threaded work.
         private readonly object _resetLock = new();
         private readonly object _mqttLock = new();
         private readonly object _actionLock = new();
@@ -51,17 +56,17 @@ namespace Pulsar_DomeDriver.Driver
         private readonly object _watchdogLock = new object();
         private readonly object _connectionLock = new();
 
-        //polling thread for serial comms
+        // Polling loop state (periodic status reads over serial).
         private CancellationTokenSource _pollingCancel = null;
         private bool _pollingActive = false;
         private readonly object _pollingLock = new();
         private Task _pollingTask = null;
         private volatile bool _manualDisconnect = false;
 
-        // Timestamp updated by polling loop
+        // Timestamp updated by polling loop for stall detection.
         private DateTime _lastPollTimestamp = DateTime.MinValue;
 
-        // Watchdog control
+        // Watchdog tasks and heartbeat timing.
         private CancellationTokenSource? _systemWatchdogCts;
         private Task? _systemWatchdogTask;
         private readonly TimeSpan _systemWatchdogInterval = TimeSpan.FromSeconds(5);         // How often to check
@@ -75,20 +80,20 @@ namespace Pulsar_DomeDriver.Driver
         private DateTime _lastGNSHeartbeat = DateTime.MinValue;
         private readonly TimeSpan _alarmTimeout = TimeSpan.FromSeconds(30); // or 2× watchdog interval
 
-        // Auto-reconnect
+        // Auto-reconnect loop state.
         private CancellationTokenSource? _autoReconnectCts;
         private Task? _autoReconnectTask;
         private readonly TimeSpan _autoReconnectInterval = TimeSpan.FromMinutes(1);
         private int _reconnectAttempts = 0;
         private readonly int _maxReconnectAttempts = 10;
 
-        // Metrics
+        // Diagnostics counters for command success/failure and timing.
         private int _commandSuccessCount = 0;
         private int _commandFailureCount = 0;
         private DateTime _lastCommandTime = DateTime.MinValue;
         private TimeSpan _totalCommandTime = TimeSpan.Zero;
 
-        // Dome/Shutter status variables
+        // Cached status strings for change-driven logging/MQTT.
         private string oldDomeActivity;
         private string oldShutterActivity;
         private string domeCurrent;
@@ -96,16 +101,16 @@ namespace Pulsar_DomeDriver.Driver
         private string domeOutputStatus;
         private double changeAzimuth;
 
-        // Dome/Shutter control
+        // Action watchdog used for long-running operations (slew, shutter).
         private CancellationTokenSource? _actionWatchdogCts;
         private ActionWatchdog _actionWatchdog;
 
-        // last command
-        private DomeCommandIntent _lastIntent = DomeCommandIntent.None;
-        private const int MinSlewGraceMs = 3000;
+        // Last command intent and a grace period to keep Slewing true for fast moves.
+        private volatile DomeCommandIntent _lastIntent = DomeCommandIntent.None;
         private long _slewGraceUntilTicks = 0;
+        private volatile bool _homeBeforeParkActive = false;
 
-        // MQTT
+        // MQTT topics and publisher for status/alarm messages.
         private MqttPublisher _mqttPublisher;
         string _mqttStatus = "Dome/DriverStatus";
         string _mqttDomeStatus = "Dome/Dome/Status";
@@ -114,13 +119,13 @@ namespace Pulsar_DomeDriver.Driver
         string _mqttAlarmMessage = "Dome/Alarm/Message";
         string _mqttWatchdog = "Dome/Watchdog";
 
-        // GNS
+        // GNS (Goodnight System) notifications.
         private GNS _GNS;
 
-        // Dsiposal etc
+        // Disposal state.
         private volatile bool _disposed = false;
 
-        // alarm
+        // Alarm latch and MQTT gating to prevent spam.
         private volatile bool _alarmTriggered = false;
         private volatile bool _allowMqttAlarm = false;
         private readonly object _alarmLock = new();
@@ -202,6 +207,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void ValidateConfiguration()
         {
+            // Fail fast if any configured values fall outside known safe ranges.
             var issues = new List<string>();
 
             if (_config.pollingIntervalMs < 500 || _config.pollingIntervalMs > 10000)
@@ -215,6 +221,9 @@ namespace Pulsar_DomeDriver.Driver
 
             if (_config.sendVerifyMaxRetries < 1 || _config.sendVerifyMaxRetries > 10)
                 issues.Add($"Send/verify retries {_config.sendVerifyMaxRetries} is out of safe range (1-10)");
+
+            if (_config.SlewSettleMs < 0 || _config.SlewSettleMs > 60000)
+                issues.Add($"Slew settle time {_config.SlewSettleMs}ms is out of safe range (0-60000ms)");
 
             if (issues.Any())
             {
@@ -231,6 +240,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void InitializeSerialPort()
         {
+            // Port name comes from the ASCOM profile; other settings are fixed to controller spec.
             string serialPort = _profile.GetValue(_config._driverId, "SerialPort", "");
             if (!string.IsNullOrWhiteSpace(serialPort))
             {
@@ -262,6 +272,7 @@ namespace Pulsar_DomeDriver.Driver
                 {
                     if (value)
                     {
+                        // Transition to connected state: serial handshake, MQTT (optional), monitors, then polling.
                         bool alreadyConnected;
                         lock (_pollingLock)
                         {
@@ -327,11 +338,14 @@ namespace Pulsar_DomeDriver.Driver
 
         private void DisconnectInternal(bool manual)
         {
+            // Manual disconnect disables auto-reconnect/alarm loops; auto disconnect keeps them for recovery.
             if (manual)
             {
                 _manualDisconnect = true;
                 StopAutoReconnect();
                 StopAlarmMonitor();
+                CancelCurrentActionWatchdog(suppressReset: true);
+                _lastIntent = DomeCommandIntent.None;
             }
 
             StopWatchdog();
@@ -346,6 +360,7 @@ namespace Pulsar_DomeDriver.Driver
 
             if (pollingStopped && pollingWaitTask != null)
             {
+                // Avoid closing the port while the polling task is still reading.
                 bool isPollingTask = Task.CurrentId.HasValue && pollingWaitTask.Id == Task.CurrentId.Value;
                 if (isPollingTask)
                 {
@@ -373,6 +388,7 @@ namespace Pulsar_DomeDriver.Driver
             if (publisher != null)
             {
 
+                // Disconnect MQTT on a background task so we do not block the caller.
                 Task.Run(async () =>
                 {
                     try
@@ -473,6 +489,7 @@ namespace Pulsar_DomeDriver.Driver
 
             Thread.Sleep(_config.initialPingDelay);
 
+            // Controller should respond to a PULSAR ping; retry twice then clean up.
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 //_guard.Send("NOP", false); // Arduino ignores this
@@ -523,6 +540,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             try
             {
+                // "PULSAR" is a lightweight handshake to confirm the controller is responsive.
                 return SendAndVerify("PULSAR", ResponseMode.MatchExact, new[] { _pingResponse }).IsMatch;
             }
             catch (Exception ex)
@@ -534,13 +552,42 @@ namespace Pulsar_DomeDriver.Driver
 
         public bool DisconnectController(bool reboot = false)
         {
+            // Reboot path: force-close the port and guard without waiting on polling.
             if (reboot)
             {
                 try
                 {
-                    _port?.Close();
-                    _guard?.Dispose();
+                    StopPolling(force: true);
+                    StopWatchdog();
+
+                    var guard = _guard;
                     _guard = null;
+
+                    if (guard != null)
+                    {
+                        try { guard.Dispose(); }
+                        catch (Exception ex)
+                        {
+                            SafeLog($"Error disposing SerialPortGuard: {ex.Message}", LogLevel.Error);
+                        }
+                    }
+
+                    if (_port != null)
+                    {
+                        try
+                        {
+                            if (_port.IsOpen)
+                                _port.Close();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                        }
+                        catch (Exception ex)
+                        {
+                            SafeLog($"Forced port close failed: {ex.Message}", LogLevel.Error);
+                        }
+                    }
+
                     SafeLog("Serial port forcibly closed.", LogLevel.Info);
                 }
                 catch (Exception ex)
@@ -552,23 +599,40 @@ namespace Pulsar_DomeDriver.Driver
 
             try
             {
-                StopPolling();
+                StopPolling(force: true);
                 StopWatchdog();
 
-                if (_port != null && _port.IsOpen)
+                var guard = _guard;
+                _guard = null;
+
+                if (guard != null)
+                {
+                    try { guard.Dispose(); }
+                    catch (Exception ex)
+                    {
+                        SafeLog($"Error disposing SerialPortGuard: {ex.Message}", LogLevel.Error);
+                    }
+                }
+
+                if (_port != null)
                 {
                     try
                     {
-                        _port.Close();
-                        _guard?.Dispose();
-                        _guard = null;
-                        SafeLog($"Serial port {_port.PortName} closed.", LogLevel.Info);
+                        if (_port.IsOpen)
+                        {
+                            _port.Close();
+                            SafeLog($"Serial port {_port.PortName} closed.", LogLevel.Info);
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
                     }
                     catch (Exception ex)
                     {
                         SafeLog($"Error closing serial port {_port.PortName}: {ex.Message}", LogLevel.Error);
                     }
                 }
+
                 SafeLog("Driver disconnected.", LogLevel.Info);
                 return true;
             }
@@ -581,6 +645,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void LogConnectionSnapshot()
         {
+            // Diagnostic dump to help investigate stalls or disconnects.
             SafeLog("=== Dome Driver Connection Snapshot ===", LogLevel.Trace);
 
             SafeLog($"PollingActive: {_pollingActive}", LogLevel.Trace);
@@ -601,6 +666,7 @@ namespace Pulsar_DomeDriver.Driver
 
         #region Polling section
 
+        // Polling keeps _config in sync with controller status and drives command completion.
         public void SetPollingInterval(int milliseconds)
         {
             lock (_pollingLock)
@@ -618,6 +684,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             SafeLog("StartPolling() invoked - launching polling loop", LogLevel.Info);
 
+            // Ensure only one polling task runs at a time.
             Task? pollingWaitTask = null;
             int pollingWaitTimeoutMs = 0;
 
@@ -734,6 +801,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             lock (_pollingLock)
             {
+                // Do not interrupt active command unless forced (serial safety).
                 if (_config.CommandInProgress && !force)
                 {
                     SafeLog("Polling stop deferred: command in progress.", LogLevel.Debug);
@@ -757,6 +825,11 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task PollLoopAsync(CancellationToken token)
         {
+            // Polling loop flow:
+            // - wait for startup readiness (no command/reboot),
+            // - read status at interval,
+            // - mark action watchdog success when targets are reached,
+            // - trigger recovery after repeated errors.
             if (_disposed) return;
 
             SafeLog("Polling loop heartbeat", LogLevel.Trace);
@@ -765,7 +838,7 @@ namespace Pulsar_DomeDriver.Driver
 
             try
             {
-                // ?? Wait for readiness if command or reboot was active at launch
+                // Wait for readiness if a command or reboot was active at launch.
                 while (!_disposed && !token.IsCancellationRequested)
                 {
                     bool commandInProgress;
@@ -824,7 +897,7 @@ namespace Pulsar_DomeDriver.Driver
                             SystemStatusInternal(token); // Safe outside lock
                             errorCount = 0;
 
-                            // ?? Watchdog success coordination
+                            // Action watchdog: mark success if polling shows target reached.
                             if (_lastIntent == DomeCommandIntent.GoHome && _config.HomeStatus)
                                 _actionWatchdog?.MarkSuccess();
                             if (_lastIntent == DomeCommandIntent.Park && _config.ParkStatus)
@@ -899,6 +972,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void HandleDriverFailure(Exception lastException, int errorCount = 0, string reason = "Unknown")
         {
+            // Escalate persistent polling failures into an alarm and a controlled disconnect.
             //SafeLog($"[DriverFailure] Triggered by {reason}. Last error: {lastException.Message}", LogLevel.Error);
             AlarmOn(reason);
             //_mqttPublisher?.PublishAsync(_mqttAlarm, $"Alarm: {reason}");
@@ -915,6 +989,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public void StartSystemMonitors(bool startWatchdog = true)
         {
+            // Start background safety/health monitors.
             if (startWatchdog)
             {
                 StartWatchdog();
@@ -924,6 +999,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void StartWatchdog()
         {
+            // Watchdog task handles heartbeats and detects stalled polling.
             StartAlarmMonitor();
             lock (_watchdogLock)
             {
@@ -967,7 +1043,7 @@ namespace Pulsar_DomeDriver.Driver
                             {
                                 await Task.Delay(_systemWatchdogInterval, token);
                                 _lastWatchdogPing = DateTime.UtcNow;
-                                // ?? MQTT heartbeat
+                                // MQTT heartbeat and alarm pulse.
                                 if (_config.UseMQTT)
                                 {
                                     if (_mqttPublisher?.IsConnected == true)
@@ -983,7 +1059,7 @@ namespace Pulsar_DomeDriver.Driver
                                     }
                                 }
 
-                                // ?? GNS heartbeat every 5 minutes (300 seconds)
+                                // GNS heartbeat every 5 minutes (300 seconds) when idle.
                                 bool commandActive = _config.ForceBusy ||
                                     _config.ActionWatchdogRunning ||
                                     (_lastIntent != DomeCommandIntent.None && !IsCommandComplete());
@@ -993,7 +1069,7 @@ namespace Pulsar_DomeDriver.Driver
                                     _lastGNSHeartbeat = DateTime.UtcNow;
                                 }
 
-                                // ?? Polling stall detection
+                                // Polling stall detection: restart polling if it stops updating.
                                 var elapsed = DateTime.UtcNow - _lastPollTimestamp;
                                 if (elapsed > _pollingStallThreshold)
                                 {
@@ -1058,6 +1134,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void StartAutoReconnect()
         {
+            // Background loop that periodically tries to reconnect when idle.
             lock (_watchdogLock)
             {
                 if (_disposed) return;
@@ -1168,6 +1245,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void StartAlarmMonitor()
         {
+            // Separate timer that raises an alarm if watchdog heartbeats stop.
             lock (_alarmTimerLock)
             {
                 _alarmTimerCts?.Cancel();
@@ -1228,6 +1306,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             lock (_alarmLock)
             {
+                // Latching alarm: first trigger wins, later calls are ignored.
                 if (_alarmTriggered)
                 {
                     // Already triggered - do nothing
@@ -1237,6 +1316,7 @@ namespace Pulsar_DomeDriver.Driver
                 _alarmTriggered = true;
 
                 string alarmMessage = message ?? "Dome driver alarm triggered";
+                // Allow MQTT alarm only after ResetAlarmMonitor enables it.
                 if (!_allowMqttAlarm)
                 {
                     SafeLog("Alarm triggered but MQTT alarm suppressed", LogLevel.Warning);
@@ -1274,6 +1354,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             lock (_alarmLock)
             {
+                // Final alarm overrides MQTT suppression.
                 _allowMqttAlarm = true;
                 _alarmTriggered = true;
             }
@@ -1304,6 +1385,7 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
+            // Poll a consistent snapshot of dome/home/park status with retries.
             var retryPolicy = new RetryPolicy
             {
                 MaxAttempts = _config.statusMaxRetries,
@@ -1375,6 +1457,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public void CompleteSystemStatus()
         {
+            // Translate raw state into readable status, publish MQTT, and resolve command completion.
             SafeLog($"[DomeStatus] Invoked at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
 
             try
@@ -1390,8 +1473,22 @@ namespace Pulsar_DomeDriver.Driver
                     default: domeCurrent = "Unknown state"; break;
                 }
 
-                if (_config.HomeStatus) domeCurrent = "Home";
-                if (_config.ParkStatus) domeCurrent = "Parked";
+                if (_homeBeforeParkActive)
+                {
+                    domeCurrent = "Parking (Homing)";
+                }
+                else if (_config.ParkStatus)
+                {
+                    domeCurrent = "Parked";
+                }
+                else if (_config.HomePark && _lastIntent == DomeCommandIntent.Park)
+                {
+                    domeCurrent = "Slewing";
+                }
+                else if (_config.HomeStatus)
+                {
+                    domeCurrent = "Home";
+                }
 
                 // Shutter status description
                 switch (_config.ShutterStatus)
@@ -1435,6 +1532,10 @@ namespace Pulsar_DomeDriver.Driver
 
                     _actionWatchdog?.MarkSuccess();
                     var completedIntent = _lastIntent;
+                    if (completedIntent != DomeCommandIntent.None)
+                    {
+                        SetSlewGracePeriod();
+                    }
                     _lastIntent = DomeCommandIntent.None;
 
                     switch (completedIntent)
@@ -1466,6 +1567,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public bool ParseDomeStatus()
         {
+            // "V" returns a multi-line, tab-delimited status block.
             string? raw = SendAndVerify("V", ResponseMode.Raw).Response;
 
             if (string.IsNullOrWhiteSpace(raw))
@@ -1506,6 +1608,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool TryParseDomeTokens(string[] tokens)
         {
+            // Tokens are controller status fields; parse and update _config under lock.
             if (tokens.Length < 13)
             {
                 SafeLog($"Insufficient token count: expected 13, got {tokens.Length}", LogLevel.Debug);
@@ -1656,7 +1759,14 @@ namespace Pulsar_DomeDriver.Driver
 
         public void SlewingStatus()
         {
+            // Combine intent, reset state, grace period, and controller status into Slewing.
             if (_config.Resetting || _config.Rebooting)
+            {
+                _config.SlewingStatus = true;
+                return;
+            }
+
+            if (_homeBeforeParkActive)
             {
                 _config.SlewingStatus = true;
                 return;
@@ -1688,8 +1798,11 @@ namespace Pulsar_DomeDriver.Driver
 
         private void SetSlewGracePeriod()
         {
-            // Allow fast slews to be visible to clients that poll Slewing.
-            int graceMs = Math.Max(_config.pollingIntervalMs * 2, MinSlewGraceMs);
+            // Keep Slewing true briefly after actions to let clients settle.
+            int graceMs = _config.SlewSettleMs;
+            if (graceMs <= 0)
+                return;
+
             long untilTicks = DateTime.UtcNow.AddMilliseconds(graceMs).Ticks;
             Interlocked.Exchange(ref _slewGraceUntilTicks, untilTicks);
         }
@@ -1707,14 +1820,33 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool IsCommandComplete()
         {
-            return _lastIntent switch
+            DomeCommandIntent intent = _lastIntent;
+            bool homeStatus;
+            bool parkStatus;
+            int domeState;
+            short shutterStatus;
+            double azimuth;
+            double slewAz;
+            bool homeBeforeParkActive = _homeBeforeParkActive;
+
+            lock (_pollingLock)
             {
-                DomeCommandIntent.GoHome => _config.DomeState == 0 && _config.HomeStatus,
-                DomeCommandIntent.SlewAzimuth => _config.DomeState == 0 &&
-                    AngularDistance(_config.Azimuth, _config.SlewAz) <= _config.AzimuthTolerance,
-                DomeCommandIntent.OpenShutter => _config.ShutterStatus == 0,
-                DomeCommandIntent.CloseShutter => _config.ShutterStatus == 1,
-                DomeCommandIntent.Park => _config.DomeState == 0 && _config.ParkStatus,
+                homeStatus = _config.HomeStatus;
+                parkStatus = _config.ParkStatus;
+                domeState = _config.DomeState;
+                shutterStatus = _config.ShutterStatus;
+                azimuth = _config.Azimuth;
+                slewAz = _config.SlewAz;
+            }
+
+            return intent switch
+            {
+                DomeCommandIntent.GoHome => domeState == 0 && homeStatus,
+                DomeCommandIntent.SlewAzimuth => domeState == 0 &&
+                    AngularDistance(azimuth, slewAz) <= _config.AzimuthTolerance,
+                DomeCommandIntent.OpenShutter => shutterStatus == 0,
+                DomeCommandIntent.CloseShutter => shutterStatus == 1,
+                DomeCommandIntent.Park => !homeBeforeParkActive && domeState == 0 && parkStatus,
                 _ => true
             };
         }
@@ -1755,8 +1887,21 @@ namespace Pulsar_DomeDriver.Driver
             return $"{domeLine}{Environment.NewLine}{shutterLine}";
         }
 
+        private string BuildSlewStatusSummary()
+        {
+            double targetAz = _config.TargetAzimuth;
+            if (_lastIntent == DomeCommandIntent.SlewAzimuth && !IsCommandComplete())
+                targetAz = _config.SlewAz;
+
+            double normalizedTarget = NormalizeAzimuth(targetAz);
+            return $"Slewing to az {normalizedTarget:0}";
+        }
+
         private string BuildDomeStatusLine()
         {
+            if (_homeBeforeParkActive)
+                return $"Dome = {BuildSlewStatusSummary()}";
+
             if (_config.ParkStatus)
                 return "Dome = Parked";
 
@@ -1768,12 +1913,7 @@ namespace Pulsar_DomeDriver.Driver
 
             if (_config.DomeState == 1)
             {
-                double targetAz = _config.TargetAzimuth;
-                if (_lastIntent == DomeCommandIntent.SlewAzimuth && !IsCommandComplete())
-                    targetAz = _config.SlewAz;
-
-                double normalizedTarget = NormalizeAzimuth(targetAz);
-                return $"Dome = Slewing to az {normalizedTarget:0}";
+                return $"Dome = {BuildSlewStatusSummary()}";
             }
 
             return $"Dome = az {_config.Azimuth:0}";
@@ -1797,6 +1937,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public class RetryPolicy
         {
+            // Simple retry helper used for serial reads and status polling.
             public Action<string, LogLevel>? Log { get; set; }
             public int MaxAttempts { get; set; } = 3;
             public int DelayMs { get; set; } = 100;
@@ -1846,6 +1987,7 @@ namespace Pulsar_DomeDriver.Driver
         private void SafeLog(string message, LogLevel level)
         {
             if (_disposed) return;
+            // Logging is best-effort; never throw from logging during shutdown.
             try { _logger?.Log(message, level); }
             catch { /* suppress logging errors during disposal */ }
         }
@@ -1856,6 +1998,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public async Task ResetRoutineAsync(string reset = "full")
         {
+            // Reset flow: stop polling/watchdogs, attempt soft reset then hard reset, replay last command.
             lock (_resetLock)
             {
                 if (_config.Resetting)
@@ -1867,7 +2010,7 @@ namespace Pulsar_DomeDriver.Driver
                 _config.Resetting = true;
             }
 
-            CancelCurrentActionWatchdog();
+            CancelCurrentActionWatchdog(suppressReset: true);
 
             TryMQTTPublish("Dome/Debug", "in reset");
 
@@ -2045,6 +2188,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void RearmResetFlagsAfterSuccess()
         {
+            // Allow future reset attempts after a successful recovery.
             _config.SoftResetAttempted = false;
             _config.HardResetAttempted = false;
         }
@@ -2053,6 +2197,7 @@ namespace Pulsar_DomeDriver.Driver
         {
             try
             {
+                // Set Rebooting so other operations pause during the reset window.
                 SafeLog($"{type} reset initiated.", LogLevel.Warning);
                 _GNS.SendGNS(GNSType.Stop, $"{type} reset initiated.");
 
@@ -2096,6 +2241,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task<bool> PerformSoftReset()
         {
+            // Soft reset asks controller to restart and watches shutter status for reboot signal.
             _config.SoftResetAttempted = true;
             _config.HardResetAttempted = false;
 
@@ -2127,6 +2273,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task<bool> PerformHardReset()
         {
+            // Hard reset uses external power control to cycle the controller, then reconnects.
             _config.HardResetAttempted = true;
 
             string exePath = _config.ResetExe;
@@ -2174,6 +2321,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private async Task<bool> WaitForShutterReady(int timeoutMs = 30000)
         {
+            // Wait for shutter status to return to a valid operational range.
             int elapsed = 0;
             int pollInterval = 1000;
 
@@ -2199,6 +2347,7 @@ namespace Pulsar_DomeDriver.Driver
 
         public async Task<bool> ResetDisconnection(string type)
         {
+            // Force disconnect with retries so the port is released before power cycling.
             // Disconnect device
             int maxRetries = _config._connectRetryCount;
             int retryDelayMs = _config._connectRetryDelay;
@@ -2218,6 +2367,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool LaunchResetProcess(string exePath, string parameters, string label)
         {
+            // Run external exe that toggles controller power (OFF/ON).
             if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
             {
                 SafeLog($"Reset executable not found: '{exePath}'", LogLevel.Error);
@@ -2268,7 +2418,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool ReplayLastCommand(bool allowDuringReset)
         {
-
+            // After a reset, re-issue the last intent to finish the user-requested action.
             SafeLog($"Replaying last intent after reset: {_lastIntent}", LogLevel.Info);
 
             if (_lastIntent == DomeCommandIntent.None)
@@ -2349,6 +2499,7 @@ namespace Pulsar_DomeDriver.Driver
 
             try
             {
+                // Create the publisher under lock to avoid races with disconnect.
                 MqttPublisher publisher;
                 lock (_mqttLock)
                 {
@@ -2418,6 +2569,7 @@ namespace Pulsar_DomeDriver.Driver
         //    }
         //}
 
+        // Null-safe, fire-and-forget publish to avoid blocking driver threads.
         private void TryMQTTPublish(string topic, string message)
         {
             MqttPublisher publisher;
@@ -2493,6 +2645,7 @@ namespace Pulsar_DomeDriver.Driver
                 throw new ASCOM.NotConnectedException("Serial port is not ready.");
             }
 
+            // SerialPortGuard manages exclusive access and tracks CommandInProgress.
             SafeLog($"Dispatching command: {command} (ExpectResponse={expectResponse})", LogLevel.Trace);
 
             return _guard.Send(command, expectResponse);
@@ -2504,6 +2657,7 @@ namespace Pulsar_DomeDriver.Driver
             IEnumerable<string>? expectedResponses = null,
             RetryPolicy? retryPolicy = null)
         {
+            // Wrap SendCommand with retry + response matching, and update command metrics.
             retryPolicy ??= new RetryPolicy
             {
                 MaxAttempts = _config.sendVerifyMaxRetries,
@@ -2614,6 +2768,7 @@ namespace Pulsar_DomeDriver.Driver
             if (_disposed) return;
             _disposed = true;
 
+            // Dispose tries hard to clean up all resources; failures are collected.
             var failures = new List<string>();
 
             void SafeDispose(Action action, string name)
@@ -2636,8 +2791,8 @@ namespace Pulsar_DomeDriver.Driver
                 }
             }, "AppDomainHandlers");
 
-            SafeDispose(() => StopPolling(), "StopPolling");
-            SafeDispose(() => CancelCurrentActionWatchdog(), "CancelCurrentActionWatchdog");
+            SafeDispose(() => StopPolling(force: true), "StopPolling");
+            SafeDispose(() => CancelCurrentActionWatchdog(suppressReset: true), "CancelCurrentActionWatchdog");
             SafeDispose(() => StopWatchdog(), "StopWatchdog");
             SafeDispose(() => StopAutoReconnect(), "StopAutoReconnect");
             SafeDispose(() => DisconnectMqttSafely(), "DisconnectMqttSafely");
@@ -2828,7 +2983,11 @@ namespace Pulsar_DomeDriver.Driver
         {
             get
             {
+                // Slewing is derived from reset state, intent/grace period, and controller status.
                 if (_config.Resetting || _config.Rebooting)
+                    return true;
+
+                if (_homeBeforeParkActive)
                     return true;
 
                 if (_lastIntent != DomeCommandIntent.None && !IsCommandComplete())
@@ -2848,6 +3007,7 @@ namespace Pulsar_DomeDriver.Driver
 
         #region Ascom Action helpers
 
+        // Serialize action commands so only one uses the serial link at a time.
         private void EnterCommandGate(string actionLabel)
         {
             SafeLog($"Waiting for command gate: {actionLabel}", LogLevel.Debug);
@@ -2874,6 +3034,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private void EnsureReadyForCommand(string actionLabel, bool allowDuringReset)
         {
+            // Guard against commands during dispose, reset, or while busy.
             if (_disposed)
                 throw new ObjectDisposedException(nameof(DomeDriver));
 
@@ -2913,6 +3074,7 @@ namespace Pulsar_DomeDriver.Driver
  double? gnsTimeoutFactor = null,
  bool allowDuringReset = false)
         {
+            // Shared execution path for dome/shutter actions.
             EnterCommandGate(actionLabel);
             try
             {
@@ -2928,6 +3090,7 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         updateConfigBeforeWatchdog();
                     }
+                    SetSlewGracePeriod();
 
                     if (!WaitForControllerReady(actionLabel))
                         return;
@@ -2969,6 +3132,7 @@ namespace Pulsar_DomeDriver.Driver
                 _GNS.SendGNS(GNSType.New, gnsOverride ?? message, gnsTimeout);
             }
 
+            // Stop polling so command I/O has exclusive serial access.
             bool pollingWasStopped = StopPolling();
             if (!pollingWasStopped)
             {
@@ -3002,12 +3166,18 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool TrySendCommand(string command, DomeCommandIntent intent, Func<bool> alreadyAtTarget, string actionLabel)
         {
-            if (alreadyAtTarget())
+            // Skip sending if polling already reports we're at the target.
+            bool atTarget = alreadyAtTarget();
+            if (atTarget && intent != DomeCommandIntent.SlewAzimuth)
             {
-                SafeLog("Already at target — skipping command and watchdog.", LogLevel.Info);
+                SafeLog("Already at target - skipping command and watchdog.", LogLevel.Info);
                 _config.ForceBusy = false;
                 StartPolling();
                 return false;
+            }
+            if (atTarget && intent == DomeCommandIntent.SlewAzimuth)
+            {
+                SafeLog("Already at target but sending ABS anyway to avoid stale azimuth state.", LogLevel.Debug);
             }
 
             if (!SendAndVerify(command, ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
@@ -3022,6 +3192,7 @@ namespace Pulsar_DomeDriver.Driver
 
         private bool WaitForControllerReady(string actionLabel)
         {
+            // Poll until controller reports ready; trigger reset if timeout hits.
             SafeLog($"[WaitForControllerReady] ControllerReady={_config.ControllerReady} at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Trace);
             SafeLog($"[WaitForControllerReady] Entered at {DateTime.UtcNow:HH:mm:ss.fff}", LogLevel.Debug);
             int waitMs = 0;
@@ -3064,6 +3235,7 @@ namespace Pulsar_DomeDriver.Driver
     string mqttSuccess,
     string mqttFail)
         {
+            // Per-action watchdog monitors long-running actions and triggers recovery on timeout.
             var cts = new CancellationTokenSource();
 
             try { _actionWatchdogCts?.Dispose(); } catch { }
@@ -3214,8 +3386,11 @@ namespace Pulsar_DomeDriver.Driver
 
         private void SlewToAzimuthInternal(double azimuth, bool allowDuringReset)
         {
-            if (azimuth < 0 || azimuth >= 360)
+            if (double.IsNaN(azimuth) || double.IsInfinity(azimuth) || azimuth < 0 || azimuth >= 360)
+            {
+                SafeLog($"Invalid azimuth request: {azimuth}", LogLevel.Warning);
                 throw new InvalidValueException($"Invalid Azimuth request of {azimuth} - must be between 0 and less than 360 degrees.");
+            }
 
             changeAzimuth = AngularDistance(azimuth, _config.Azimuth);
             string message = $"Slewing to {azimuth}...";
@@ -3237,7 +3412,6 @@ namespace Pulsar_DomeDriver.Driver
                 {
                     _config.DomeState = 1;
                     _config.SlewingStatus = true;
-                    SetSlewGracePeriod();
                 },
                 checkStatus: () =>
                 {
@@ -3310,6 +3484,12 @@ namespace Pulsar_DomeDriver.Driver
             int timeoutMs = _config.RotationTimeout * 1000;
             LogDome(message);
 
+            if (_config.HomePark)
+            {
+                ExecuteParkWithHome(message, timeoutMs, allowDuringReset);
+                return;
+            }
+
             ExecuteDomeCommand(
                 command: "GO P",
                 message: message,
@@ -3336,6 +3516,169 @@ namespace Pulsar_DomeDriver.Driver
                 gnsTimeoutFactor: 2.5,
                 allowDuringReset: allowDuringReset
             );
+        }
+
+        private void ExecuteParkWithHome(string message, int timeoutMs, bool allowDuringReset)
+        {
+            const string actionLabel = "Park";
+
+            EnterCommandGate(actionLabel);
+            try
+            {
+                EnsureReadyForCommand(actionLabel, allowDuringReset);
+                PrepareCommandExecution(message, message, 2.5, timeoutMs, DomeCommandIntent.Park);
+
+                try
+                {
+                    if (_config.ParkStatus)
+                    {
+                        SafeLog("Already at target - skipping command and watchdog.", LogLevel.Info);
+                        _config.ForceBusy = false;
+                        return;
+                    }
+
+                    if (!_config.HomeStatus)
+                    {
+                        _homeBeforeParkActive = true;
+                        SafeLog("Home-before-park enabled; sending HOME.", LogLevel.Debug);
+
+                        if (!SendAndVerify("GO H", ResponseMode.MatchExact, new[] { _generalResponse }).IsMatch)
+                        {
+                            _homeBeforeParkActive = false;
+                            SafeLog("Home-before-park command failed: No match response.", LogLevel.Error);
+                            RaiseAlarmAndReset("Home-before-park command failed (no ACK).");
+                            return;
+                        }
+
+                        lock (_pollingLock)
+                        {
+                            _config.DomeState = 1; // moving while homing for park
+                            _config.SlewingStatus = true;
+                        }
+                        SetSlewGracePeriod();
+
+                        StartPolling();
+
+                        Task.Run(() => ContinueParkAfterHome(timeoutMs, allowDuringReset));
+                        return;
+                    }
+
+                    if (!TrySendCommand("GO P", DomeCommandIntent.Park, () => _config.ParkStatus, actionLabel))
+                        return;
+
+                    lock (_pollingLock)
+                    {
+                        _config.DomeState = 1; // moving to target (park)
+                        _config.SlewingStatus = true;
+                    }
+                    SetSlewGracePeriod();
+
+                    if (!WaitForControllerReady(actionLabel))
+                        return;
+
+                    LaunchActionWatchdog(
+                        timeout: TimeSpan.FromMilliseconds(timeoutMs),
+                        action: actionLabel,
+                        longAction: "Parking...",
+                        checkStatus: () =>
+                        {
+                            return _config.ParkStatus
+                                ? ActionWatchdog.WatchdogResult.Success
+                                : ActionWatchdog.WatchdogResult.InProgress;
+                        },
+                        mqttTopic: _mqttDomeStatus,
+                        mqttSuccess: "Dome parked.",
+                        mqttFail: "Dome failed to park."
+                    );
+                }
+                catch (Exception ex)
+                {
+                    SafeLog($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+                }
+                finally
+                {
+                    StartPolling();
+                }
+            }
+            finally
+            {
+                ExitCommandGate(actionLabel);
+            }
+        }
+
+        private void ContinueParkAfterHome(int timeoutMs, bool allowDuringReset)
+        {
+            const string actionLabel = "Park";
+
+            try
+            {
+                if (!WaitForHomeReached(timeoutMs))
+                {
+                    SafeLog("Home-before-park timed out.", LogLevel.Error);
+                    RaiseAlarmAndReset("Home-before-park timed out.");
+                    return;
+                }
+
+                StopPolling();
+                Thread.Sleep(60);
+            }
+            finally
+            {
+                _homeBeforeParkActive = false;
+            }
+
+            EnterCommandGate(actionLabel);
+            try
+            {
+                if (!TrySendCommand("GO P", DomeCommandIntent.Park, () => _config.ParkStatus, actionLabel))
+                    return;
+
+                lock (_pollingLock)
+                {
+                    _config.DomeState = 1; // moving to target (park)
+                    _config.SlewingStatus = true;
+                }
+                SetSlewGracePeriod();
+
+                if (!WaitForControllerReady(actionLabel))
+                    return;
+
+                LaunchActionWatchdog(
+                    timeout: TimeSpan.FromMilliseconds(timeoutMs),
+                    action: actionLabel,
+                    longAction: "Parking...",
+                    checkStatus: () =>
+                    {
+                        return _config.ParkStatus
+                            ? ActionWatchdog.WatchdogResult.Success
+                            : ActionWatchdog.WatchdogResult.InProgress;
+                    },
+                    mqttTopic: _mqttDomeStatus,
+                    mqttSuccess: "Dome parked.",
+                    mqttFail: "Dome failed to park."
+                );
+            }
+            catch (Exception ex)
+            {
+                SafeLog($"{actionLabel} command failed: {ex.Message}", LogLevel.Error);
+            }
+            finally
+            {
+                StartPolling();
+                ExitCommandGate(actionLabel);
+            }
+        }
+
+        private bool WaitForHomeReached(int timeoutMs)
+        {
+            int waitedMs = 0;
+            while (!_disposed && !_config.HomeStatus && waitedMs < timeoutMs)
+            {
+                Thread.Sleep(_config.pollingIntervalMs);
+                waitedMs += _config.pollingIntervalMs;
+            }
+
+            return _config.HomeStatus;
         }
 
         public void AbortSlew()
@@ -3370,7 +3713,7 @@ namespace Pulsar_DomeDriver.Driver
                     }
                     ClearSlewGracePeriod();
 
-                    CancelCurrentActionWatchdog();
+                    CancelCurrentActionWatchdog(suppressReset: true);
 
                     _config.ActionWatchdogRunning = false;
                     _lastIntent = DomeCommandIntent.None;
@@ -3453,12 +3796,11 @@ namespace Pulsar_DomeDriver.Driver
         #region Action helpers
 
         // Fully cancel and clear any active action watchdog
-        private void CancelCurrentActionWatchdog()
+        private void CancelCurrentActionWatchdog(bool suppressReset = false)
         {
-            try { _actionWatchdog?.Stop(); } catch { }
+            try { _actionWatchdog?.Cancel(suppressReset); } catch { }
             _actionWatchdog = null;
 
-            try { _actionWatchdogCts?.Cancel(); } catch { }
             try { _actionWatchdogCts?.Dispose(); } catch { }
             _actionWatchdogCts = null;
 

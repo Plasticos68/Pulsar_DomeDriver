@@ -81,6 +81,7 @@ namespace Pulsar_DomeDriver.Config
         public readonly int statusMaxRetries = 2;       // number of retries for the domestatus before alarm
         public readonly int sendVerifyMaxRetries = 5;       // number of retries for the send and verify routine
         public readonly int pollingLoopRetries = 5;
+        public int SlewSettleMs { get; set; } = 4000;
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;
@@ -267,6 +268,20 @@ namespace Pulsar_DomeDriver.Config
             }
         }
 
+        public bool HomePark
+        {
+            get
+            {
+                string resetString = GetProfileValue("HomePark", "");
+                bool success = bool.TryParse(resetString, out bool result);
+                return success ? result : false;
+            }
+            set
+            {
+                WriteProfileValue("HomePark", value.ToString().ToLower());
+            }
+        }
+
         public bool UseMQTT
         {
             get
@@ -425,6 +440,7 @@ namespace Pulsar_DomeDriver.Config
                     ("ResetParameters", ""),
                     ("ExternalReset", "false"),
                     ("InternalReset", "false"),
+                    ("HomePark", "false"),
                     ("ShutterTimeout", "90"),
                     ("RotationTimeout", "90"),
                     ("ResetDelay", "30"),

@@ -49,6 +49,7 @@ namespace Pulsar_DomeDriver.UI
 
             chkBoxDebugLog.Checked = _config.DebugLog;
             chkBoxTraceLog.Checked = _config.TraceLog;
+            chkBoxHomePark.Checked = _config.HomePark;
 
             chkBoxGNS.Checked = _config.UseGNS;
             txtBoxGNSLocation.Enabled = _config.UseGNS;
@@ -110,6 +111,7 @@ namespace Pulsar_DomeDriver.UI
             _config.LogLocation = txtBoxLogLocation.Text;
             _config.DebugLog = chkBoxDebugLog.Checked;
             _config.TraceLog = chkBoxTraceLog.Checked;
+            _config.HomePark = chkBoxHomePark.Checked;
             _config.ResetExe = txtBoxExternalExe.Text;
             _config.ResetOffParameters = txtBoxOffParameters.Text;
             _config.ResetOnParameters = txtBoxOnParameters.Text;

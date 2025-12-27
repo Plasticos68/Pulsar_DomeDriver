@@ -44,7 +44,7 @@
             this.checkBoxInternalReset = new System.Windows.Forms.CheckBox();
             this.label5 = new System.Windows.Forms.Label();
             this.txtBoxShutterTimeout = new System.Windows.Forms.TextBox();
-            this.groupBox1 = new System.Windows.Forms.GroupBox();
+            this.resetBox = new System.Windows.Forms.GroupBox();
             this.txtBoxRotationTimeout = new System.Windows.Forms.TextBox();
             this.label4 = new System.Windows.Forms.Label();
             this.txtBoxCycleDelay = new System.Windows.Forms.TextBox();
@@ -75,10 +75,13 @@
             this.label13 = new System.Windows.Forms.Label();
             this.chkBoxUseLocalhost = new System.Windows.Forms.CheckBox();
             this.groupBox4 = new System.Windows.Forms.GroupBox();
-            this.groupBox1.SuspendLayout();
+            this.generalBox = new System.Windows.Forms.GroupBox();
+            this.chkBoxHomePark = new System.Windows.Forms.CheckBox();
+            this.resetBox.SuspendLayout();
             this.groupBox2.SuspendLayout();
             this.groupBox3.SuspendLayout();
             this.groupBox4.SuspendLayout();
+            this.generalBox.SuspendLayout();
             this.SuspendLayout();
             // 
             // btnLog
@@ -109,7 +112,7 @@
             this.btnCancel.BackgroundImageLayout = System.Windows.Forms.ImageLayout.Stretch;
             this.btnCancel.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.btnCancel.Image = ((System.Drawing.Image)(resources.GetObject("btnCancel.Image")));
-            this.btnCancel.Location = new System.Drawing.Point(1539, 208);
+            this.btnCancel.Location = new System.Drawing.Point(537, 879);
             this.btnCancel.Margin = new System.Windows.Forms.Padding(4, 2, 4, 2);
             this.btnCancel.Name = "btnCancel";
             this.btnCancel.Size = new System.Drawing.Size(148, 106);
@@ -122,7 +125,7 @@
             this.btnOK.BackgroundImageLayout = System.Windows.Forms.ImageLayout.Stretch;
             this.btnOK.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.btnOK.Image = ((System.Drawing.Image)(resources.GetObject("btnOK.Image")));
-            this.btnOK.Location = new System.Drawing.Point(1310, 208);
+            this.btnOK.Location = new System.Drawing.Point(308, 879);
             this.btnOK.Margin = new System.Windows.Forms.Padding(4, 2, 4, 2);
             this.btnOK.Name = "btnOK";
             this.btnOK.Size = new System.Drawing.Size(148, 106);
@@ -134,7 +137,7 @@
             // 
             this.label2.AutoSize = true;
             this.label2.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.label2.Location = new System.Drawing.Point(89, 60);
+            this.label2.Location = new System.Drawing.Point(26, 71);
             this.label2.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.label2.Name = "label2";
             this.label2.Size = new System.Drawing.Size(132, 32);
@@ -145,7 +148,7 @@
             // 
             this.comboBoxSerialPort.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.comboBoxSerialPort.FormattingEnabled = true;
-            this.comboBoxSerialPort.Location = new System.Drawing.Point(363, 50);
+            this.comboBoxSerialPort.Location = new System.Drawing.Point(276, 63);
             this.comboBoxSerialPort.Margin = new System.Windows.Forms.Padding(4);
             this.comboBoxSerialPort.Name = "comboBoxSerialPort";
             this.comboBoxSerialPort.Size = new System.Drawing.Size(147, 40);
@@ -248,39 +251,39 @@
             this.txtBoxShutterTimeout.Size = new System.Drawing.Size(118, 39);
             this.txtBoxShutterTimeout.TabIndex = 51;
             // 
-            // groupBox1
+            // resetBox
             // 
-            this.groupBox1.Controls.Add(this.txtBoxRotationTimeout);
-            this.groupBox1.Controls.Add(this.label4);
-            this.groupBox1.Controls.Add(this.txtBoxCycleDelay);
-            this.groupBox1.Controls.Add(this.label11);
-            this.groupBox1.Controls.Add(this.btnTestResetOn);
-            this.groupBox1.Controls.Add(this.label10);
-            this.groupBox1.Controls.Add(this.txtBoxOnParameters);
-            this.groupBox1.Controls.Add(this.label9);
-            this.groupBox1.Controls.Add(this.txtBoxResetDelay);
-            this.groupBox1.Controls.Add(this.label8);
-            this.groupBox1.Controls.Add(this.checkBoxInternalReset);
-            this.groupBox1.Controls.Add(this.checkBoxExternalReset);
-            this.groupBox1.Controls.Add(this.btnTestResetOff);
-            this.groupBox1.Controls.Add(this.txtBoxShutterTimeout);
-            this.groupBox1.Controls.Add(this.label7);
-            this.groupBox1.Controls.Add(this.label5);
-            this.groupBox1.Controls.Add(this.label6);
-            this.groupBox1.Controls.Add(this.txtBoxExternalExe);
-            this.groupBox1.Controls.Add(this.txtBoxOffParameters);
-            this.groupBox1.Controls.Add(this.label3);
-            this.groupBox1.Controls.Add(this.btnReset);
-            this.groupBox1.FlatStyle = System.Windows.Forms.FlatStyle.Popup;
-            this.groupBox1.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.groupBox1.Location = new System.Drawing.Point(1051, 371);
-            this.groupBox1.Margin = new System.Windows.Forms.Padding(4);
-            this.groupBox1.Name = "groupBox1";
-            this.groupBox1.Padding = new System.Windows.Forms.Padding(4);
-            this.groupBox1.Size = new System.Drawing.Size(952, 599);
-            this.groupBox1.TabIndex = 52;
-            this.groupBox1.TabStop = false;
-            this.groupBox1.Text = "Reset";
+            this.resetBox.Controls.Add(this.txtBoxRotationTimeout);
+            this.resetBox.Controls.Add(this.label4);
+            this.resetBox.Controls.Add(this.txtBoxCycleDelay);
+            this.resetBox.Controls.Add(this.label11);
+            this.resetBox.Controls.Add(this.btnTestResetOn);
+            this.resetBox.Controls.Add(this.label10);
+            this.resetBox.Controls.Add(this.txtBoxOnParameters);
+            this.resetBox.Controls.Add(this.label9);
+            this.resetBox.Controls.Add(this.txtBoxResetDelay);
+            this.resetBox.Controls.Add(this.label8);
+            this.resetBox.Controls.Add(this.checkBoxInternalReset);
+            this.resetBox.Controls.Add(this.checkBoxExternalReset);
+            this.resetBox.Controls.Add(this.btnTestResetOff);
+            this.resetBox.Controls.Add(this.txtBoxShutterTimeout);
+            this.resetBox.Controls.Add(this.label7);
+            this.resetBox.Controls.Add(this.label5);
+            this.resetBox.Controls.Add(this.label6);
+            this.resetBox.Controls.Add(this.txtBoxExternalExe);
+            this.resetBox.Controls.Add(this.txtBoxOffParameters);
+            this.resetBox.Controls.Add(this.label3);
+            this.resetBox.Controls.Add(this.btnReset);
+            this.resetBox.FlatStyle = System.Windows.Forms.FlatStyle.Popup;
+            this.resetBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.resetBox.Location = new System.Drawing.Point(55, 224);
+            this.resetBox.Margin = new System.Windows.Forms.Padding(4);
+            this.resetBox.Name = "resetBox";
+            this.resetBox.Padding = new System.Windows.Forms.Padding(4);
+            this.resetBox.Size = new System.Drawing.Size(952, 622);
+            this.resetBox.TabIndex = 52;
+            this.resetBox.TabStop = false;
+            this.resetBox.Text = "Reset";
             // 
             // txtBoxRotationTimeout
             // 
@@ -535,7 +538,7 @@
             this.groupBox2.Controls.Add(this.btnGNS);
             this.groupBox2.Controls.Add(this.label12);
             this.groupBox2.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.groupBox2.Location = new System.Drawing.Point(51, 654);
+            this.groupBox2.Location = new System.Drawing.Point(1071, 224);
             this.groupBox2.Margin = new System.Windows.Forms.Padding(4);
             this.groupBox2.Name = "groupBox2";
             this.groupBox2.Padding = new System.Windows.Forms.Padding(4);
@@ -553,7 +556,7 @@
             this.groupBox3.Controls.Add(this.label13);
             this.groupBox3.Controls.Add(this.chkBoxUseLocalhost);
             this.groupBox3.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.groupBox3.Location = new System.Drawing.Point(55, 371);
+            this.groupBox3.Location = new System.Drawing.Point(1071, 566);
             this.groupBox3.Margin = new System.Windows.Forms.Padding(4);
             this.groupBox3.Name = "groupBox3";
             this.groupBox3.Padding = new System.Windows.Forms.Padding(4);
@@ -624,7 +627,7 @@
             this.groupBox4.Controls.Add(this.label1);
             this.groupBox4.Controls.Add(this.btnLog);
             this.groupBox4.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.groupBox4.Location = new System.Drawing.Point(51, 167);
+            this.groupBox4.Location = new System.Drawing.Point(1071, 30);
             this.groupBox4.Margin = new System.Windows.Forms.Padding(4);
             this.groupBox4.Name = "groupBox4";
             this.groupBox4.Padding = new System.Windows.Forms.Padding(4);
@@ -633,33 +636,59 @@
             this.groupBox4.TabStop = false;
             this.groupBox4.Text = "Log";
             // 
+            // generalBox
+            // 
+            this.generalBox.Controls.Add(this.chkBoxHomePark);
+            this.generalBox.Controls.Add(this.comboBoxSerialPort);
+            this.generalBox.Controls.Add(this.label2);
+            this.generalBox.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.generalBox.Location = new System.Drawing.Point(55, 30);
+            this.generalBox.Name = "generalBox";
+            this.generalBox.Size = new System.Drawing.Size(952, 154);
+            this.generalBox.TabIndex = 66;
+            this.generalBox.TabStop = false;
+            this.generalBox.Text = "General";
+            // 
+            // chkBoxHomePark
+            // 
+            this.chkBoxHomePark.AutoSize = true;
+            this.chkBoxHomePark.CheckAlign = System.Drawing.ContentAlignment.MiddleRight;
+            this.chkBoxHomePark.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.chkBoxHomePark.Location = new System.Drawing.Point(519, 63);
+            this.chkBoxHomePark.Margin = new System.Windows.Forms.Padding(4);
+            this.chkBoxHomePark.Name = "chkBoxHomePark";
+            this.chkBoxHomePark.Size = new System.Drawing.Size(268, 36);
+            this.chkBoxHomePark.TabIndex = 50;
+            this.chkBoxHomePark.Text = "Home before Park";
+            this.chkBoxHomePark.UseVisualStyleBackColor = true;
+            // 
             // SettingsForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(11F, 24F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(2070, 1030);
+            this.Controls.Add(this.generalBox);
             this.Controls.Add(this.groupBox4);
             this.Controls.Add(this.groupBox3);
             this.Controls.Add(this.groupBox2);
-            this.Controls.Add(this.groupBox1);
-            this.Controls.Add(this.comboBoxSerialPort);
-            this.Controls.Add(this.label2);
+            this.Controls.Add(this.resetBox);
             this.Controls.Add(this.btnCancel);
             this.Controls.Add(this.btnOK);
             this.Margin = new System.Windows.Forms.Padding(4);
             this.Name = "SettingsForm";
             this.Text = "SettingsForm";
             this.Load += new System.EventHandler(this.SettingsForm_Load);
-            this.groupBox1.ResumeLayout(false);
-            this.groupBox1.PerformLayout();
+            this.resetBox.ResumeLayout(false);
+            this.resetBox.PerformLayout();
             this.groupBox2.ResumeLayout(false);
             this.groupBox2.PerformLayout();
             this.groupBox3.ResumeLayout(false);
             this.groupBox3.PerformLayout();
             this.groupBox4.ResumeLayout(false);
             this.groupBox4.PerformLayout();
+            this.generalBox.ResumeLayout(false);
+            this.generalBox.PerformLayout();
             this.ResumeLayout(false);
-            this.PerformLayout();
 
         }
 
@@ -680,7 +709,7 @@
         private System.Windows.Forms.CheckBox checkBoxInternalReset;
         private System.Windows.Forms.Label label5;
         private System.Windows.Forms.TextBox txtBoxShutterTimeout;
-        private System.Windows.Forms.GroupBox groupBox1;
+        private System.Windows.Forms.GroupBox resetBox;
         private System.Windows.Forms.Button btnTestResetOff;
         private System.Windows.Forms.Label label7;
         private System.Windows.Forms.Label label6;
@@ -711,5 +740,7 @@
         private System.Windows.Forms.Label label13;
         private System.Windows.Forms.GroupBox groupBox4;
         private System.Windows.Forms.CheckBox chkBoxUseLocalhost;
+        private System.Windows.Forms.GroupBox generalBox;
+        private System.Windows.Forms.CheckBox chkBoxHomePark;
     }
 }

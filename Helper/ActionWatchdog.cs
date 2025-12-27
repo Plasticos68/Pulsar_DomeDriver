@@ -28,6 +28,7 @@ namespace Pulsar_DomeDriver.Helper
         public bool IsRunning => _tcs != null && !_tcs.Task.IsCompleted;
 
         private volatile bool _disposed = false;
+        private volatile bool _suppressReset = false;
         private readonly object _disposeLock = new();
 
         public enum WatchdogResult
@@ -117,7 +118,7 @@ namespace Pulsar_DomeDriver.Helper
                     case WatchdogResult.Timeout:
                         _config.ForceBusy = false;
                         await PublishAsync(_mqttFailTopic, $"{_longAction} timed out.");
-                        if (_resetRoutine != null)
+                        if (!_suppressReset && _resetRoutine != null)
                         {
                             await PublishAsync(_mqttFailTopic, "Reset routine from timeout");
                             await _resetRoutine.Invoke();
@@ -128,7 +129,7 @@ namespace Pulsar_DomeDriver.Helper
                     case WatchdogResult.Error:
                         _config.ForceBusy = false;
                         await PublishAsync(_mqttFailTopic, _mqttFail);
-                        if (_resetRoutine != null)
+                        if (!_suppressReset && _resetRoutine != null)
                         {
                             await PublishAsync(_mqttFailTopic, "Reset routine due to error");
                             await _resetRoutine.Invoke();
@@ -164,9 +165,19 @@ namespace Pulsar_DomeDriver.Helper
 
         public void Stop()
         {
-            //WatchdogLogger.Log($"[{_action}] Watchdog.Stop() called — cancelling watchdog.");
-            _internalCts?.Cancel();
-            _internalCts?.Dispose();
+            //WatchdogLogger.Log($"[{_action}] Watchdog.Stop() called - cancelling watchdog.");
+            Cancel(suppressReset: false);
+        }
+
+        public void Cancel(bool suppressReset)
+        {
+            if (suppressReset)
+            {
+                _suppressReset = true;
+            }
+
+            try { _internalCts?.Cancel(); } catch { }
+            try { _internalCts?.Dispose(); } catch { }
         }
 
         private async Task PublishAsync(string topic, string message)
