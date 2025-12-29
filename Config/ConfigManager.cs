@@ -82,6 +82,7 @@ namespace Pulsar_DomeDriver.Config
         public readonly int sendVerifyMaxRetries = 5;       // number of retries for the send and verify routine
         public readonly int pollingLoopRetries = 5;
         public int SlewSettleMs { get; set; } = 4000;
+        public int RotationSettleMs { get; set; } = 4000;
 
         public double HomeAzimuth { get; private set; }
         public double ParkAzimuth { get; set; } = 0;

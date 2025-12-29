@@ -108,6 +108,11 @@ namespace Pulsar_DomeDriver.Driver
         // Last command intent and a grace period to keep Slewing true for fast moves.
         private volatile DomeCommandIntent _lastIntent = DomeCommandIntent.None;
         private long _slewGraceUntilTicks = 0;
+        // Track when a commanded slew has actually begun.
+        private const double SlewStartAzimuthDelta = 0.1;
+        private volatile bool _slewStarted = false;
+        private volatile bool _slewRequiresMotion = false;
+        private double _slewStartAzimuth = double.NaN;
         private volatile bool _homeBeforeParkActive = false;
 
         // MQTT topics and publisher for status/alarm messages.
@@ -213,17 +218,20 @@ namespace Pulsar_DomeDriver.Driver
             if (_config.pollingIntervalMs < 500 || _config.pollingIntervalMs > 10000)
                 issues.Add($"Polling interval {_config.pollingIntervalMs}ms is out of safe range (500-10000ms)");
 
-            if (_config.RotationTimeout < 10 || _config.RotationTimeout > 300)
-                issues.Add($"Rotation timeout {_config.RotationTimeout}s is out of safe range (10-300s)");
+            if (_config.RotationTimeout < 10 || _config.RotationTimeout > 600)
+                issues.Add($"Rotation timeout {_config.RotationTimeout}s is out of safe range (10-600s)");
 
-            if (_config.ShutterTimeout < 10 || _config.ShutterTimeout > 300)
-                issues.Add($"Shutter timeout {_config.ShutterTimeout}s is out of safe range (10-300s)");
+            if (_config.ShutterTimeout < 10 || _config.ShutterTimeout > 600)
+                issues.Add($"Shutter timeout {_config.ShutterTimeout}s is out of safe range (10-600s)");
 
             if (_config.sendVerifyMaxRetries < 1 || _config.sendVerifyMaxRetries > 10)
                 issues.Add($"Send/verify retries {_config.sendVerifyMaxRetries} is out of safe range (1-10)");
 
             if (_config.SlewSettleMs < 0 || _config.SlewSettleMs > 60000)
                 issues.Add($"Slew settle time {_config.SlewSettleMs}ms is out of safe range (0-60000ms)");
+
+            if (_config.RotationSettleMs < 0 || _config.RotationSettleMs > 60000)
+                issues.Add($"Rotation settle time {_config.RotationSettleMs}ms is out of safe range (0-60000ms)");
 
             if (issues.Any())
             {
@@ -346,6 +354,7 @@ namespace Pulsar_DomeDriver.Driver
                 StopAlarmMonitor();
                 CancelCurrentActionWatchdog(suppressReset: true);
                 _lastIntent = DomeCommandIntent.None;
+                ClearSlewTracking();
             }
 
             StopWatchdog();
@@ -898,6 +907,8 @@ namespace Pulsar_DomeDriver.Driver
                             errorCount = 0;
 
                             // Action watchdog: mark success if polling shows target reached.
+                            bool slewStarted = _slewStarted;
+                            bool slewRequiresMotion = _slewRequiresMotion;
                             if (_lastIntent == DomeCommandIntent.GoHome && _config.HomeStatus)
                                 _actionWatchdog?.MarkSuccess();
                             if (_lastIntent == DomeCommandIntent.Park && _config.ParkStatus)
@@ -907,11 +918,14 @@ namespace Pulsar_DomeDriver.Driver
                             if (_lastIntent == DomeCommandIntent.CloseShutter && _config.ShutterStatus == 1)
                                 _actionWatchdog?.MarkSuccess();
                             else if (_lastIntent == DomeCommandIntent.SlewAzimuth &&
+                                (!slewRequiresMotion || slewStarted) &&
                                 _config.DomeState == 0 &&
                                 AngularDistance(_config.Azimuth, _config.SlewAz) <= _config.AzimuthTolerance)
                             {
+                                SafeLog($"[CommandComplete] intent=SlewAzimuth via polling domeState={_config.DomeState} az={_config.Azimuth:0.0} slewAz={_config.SlewAz:0.0} tol={_config.AzimuthTolerance:0.0} started={slewStarted} requiresMotion={slewRequiresMotion}", LogLevel.Debug);
                                 _actionWatchdog?.MarkSuccess();
                                 _lastIntent = DomeCommandIntent.None;
+                                ClearSlewTracking();
                             }
 
                             SafeLog($"Polling cycle at {DateTime.UtcNow:HH:mm:ss}, interval {interval} ms.", LogLevel.Trace);
@@ -1295,7 +1309,7 @@ namespace Pulsar_DomeDriver.Driver
             {
                 SafeLog("Resetting Alarm Monitor alarm", LogLevel.Info);
                 _alarmTriggered = false;
-                _allowMqttAlarm = false;
+                _allowMqttAlarm = true;
                 StopAlarmMonitor();
                 TryMQTTPublish(_mqttAlarm, "Off");
                 TryMQTTPublish(_mqttAlarmMessage, "");
@@ -1316,14 +1330,14 @@ namespace Pulsar_DomeDriver.Driver
                 _alarmTriggered = true;
 
                 string alarmMessage = message ?? "Dome driver alarm triggered";
+                _GNS.SendGNS(GNSType.Alarm, alarmMessage);
+
                 // Allow MQTT alarm only after ResetAlarmMonitor enables it.
                 if (!_allowMqttAlarm)
                 {
                     SafeLog("Alarm triggered but MQTT alarm suppressed", LogLevel.Warning);
                     return;
                 }
-
-                _GNS.SendGNS(GNSType.Alarm, alarmMessage);
                 TryMQTTPublish(_mqttAlarm, "On");
                 SafeLog("Alarm triggered: status 'On' published", LogLevel.Warning);
 
@@ -1524,6 +1538,22 @@ namespace Pulsar_DomeDriver.Driver
                 bool complete = IsCommandComplete();
                 if (complete)
                 {
+                    if (_lastIntent == DomeCommandIntent.SlewAzimuth)
+                    {
+                        double azimuth;
+                        double slewAz;
+                        int domeState;
+                        double tolerance;
+                        lock (_pollingLock)
+                        {
+                            azimuth = _config.Azimuth;
+                            slewAz = _config.SlewAz;
+                            domeState = _config.DomeState;
+                            tolerance = _config.AzimuthTolerance;
+                        }
+                        SafeLog($"[CommandComplete] intent=SlewAzimuth domeState={domeState} az={azimuth:0.0} slewAz={slewAz:0.0} tol={tolerance:0.0} started={_slewStarted} requiresMotion={_slewRequiresMotion}", LogLevel.Debug);
+                    }
+
                     if (_config.ForceBusy)
                     {
                         SafeLog($"ForceBusy overridden: command {_lastIntent} appears complete based on status.", LogLevel.Debug);
@@ -1532,11 +1562,11 @@ namespace Pulsar_DomeDriver.Driver
 
                     _actionWatchdog?.MarkSuccess();
                     var completedIntent = _lastIntent;
-                    if (completedIntent != DomeCommandIntent.None)
-                    {
-                        SetSlewGracePeriod();
-                    }
                     _lastIntent = DomeCommandIntent.None;
+                    if (completedIntent == DomeCommandIntent.SlewAzimuth)
+                    {
+                        ClearSlewTracking();
+                    }
 
                     switch (completedIntent)
                     {
@@ -1553,6 +1583,7 @@ namespace Pulsar_DomeDriver.Driver
                             _GNS.SendGNS(GNSType.Stop, "Shutter closed successfully");
                             break;
                         case DomeCommandIntent.SlewAzimuth:
+                            SetRotationSettlePeriod();
                             if (changeAzimuth >= _config.JogSize)
                                 _GNS.SendGNS(GNSType.Stop, "Dome slew successful");
                             break;
@@ -1757,9 +1788,73 @@ namespace Pulsar_DomeDriver.Driver
             return false;
         }
 
+        private void BeginSlewTracking(double startAzimuth, double targetAzimuth, double change, double azimuthTolerance)
+        {
+            bool requiresMotion = azimuthTolerance <= 0
+                ? change > 0
+                : change >= azimuthTolerance;
+
+            lock (_pollingLock)
+            {
+                _slewRequiresMotion = requiresMotion;
+                _slewStarted = !requiresMotion;
+                _slewStartAzimuth = startAzimuth;
+            }
+
+            SafeLog($"[SlewTracking] Begin: start={startAzimuth:0.0}, target={targetAzimuth:0.0}, change={change:0.0}, tol={azimuthTolerance:0.0}, requiresMotion={requiresMotion}", LogLevel.Debug);
+        }
+
+        private void UpdateSlewStartState()
+        {
+            if (_lastIntent != DomeCommandIntent.SlewAzimuth)
+                return;
+
+            if (!_slewRequiresMotion || _slewStarted)
+                return;
+
+            double azimuth;
+            int domeState;
+            double startAzimuth;
+
+            lock (_pollingLock)
+            {
+                azimuth = _config.Azimuth;
+                domeState = _config.DomeState;
+                startAzimuth = _slewStartAzimuth;
+            }
+
+            if (domeState != 0)
+            {
+                _slewStarted = true;
+                SafeLog($"[SlewTracking] Start detected: domeState={domeState}", LogLevel.Debug);
+                return;
+            }
+
+            if (!double.IsNaN(startAzimuth) &&
+                AngularDistance(azimuth, startAzimuth) >= SlewStartAzimuthDelta)
+            {
+                _slewStarted = true;
+                SafeLog($"[SlewTracking] Start detected: az delta >= {SlewStartAzimuthDelta:0.0} (start={startAzimuth:0.0}, now={azimuth:0.0})", LogLevel.Debug);
+            }
+        }
+
+        private void ClearSlewTracking()
+        {
+            lock (_pollingLock)
+            {
+                _slewRequiresMotion = false;
+                _slewStarted = false;
+                _slewStartAzimuth = double.NaN;
+            }
+
+            SafeLog("[SlewTracking] Cleared.", LogLevel.Debug);
+        }
+
         public void SlewingStatus()
         {
             // Combine intent, reset state, grace period, and controller status into Slewing.
+            UpdateSlewStartState();
+
             if (_config.Resetting || _config.Rebooting)
             {
                 _config.SlewingStatus = true;
@@ -1786,14 +1881,16 @@ namespace Pulsar_DomeDriver.Driver
                 return;
             }
 
-            bool isStationary;
+            bool domeMoving;
+            bool shutterMoving;
 
             lock (_pollingLock)
             {
-                isStationary = (_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
+                domeMoving = _config.DomeState != 0;
+                shutterMoving = _config.ShutterStatus == 2 || _config.ShutterStatus == 3;
             }
 
-            _config.SlewingStatus = !isStationary;
+            _config.SlewingStatus = domeMoving || shutterMoving;
         }
 
         private void SetSlewGracePeriod()
@@ -1812,6 +1909,16 @@ namespace Pulsar_DomeDriver.Driver
             Interlocked.Exchange(ref _slewGraceUntilTicks, 0);
         }
 
+        private void SetRotationSettlePeriod()
+        {
+            int settleMs = _config.RotationSettleMs;
+            if (settleMs <= 0)
+                return;
+
+            long untilTicks = DateTime.UtcNow.AddMilliseconds(settleMs).Ticks;
+            Interlocked.Exchange(ref _slewGraceUntilTicks, untilTicks);
+        }
+
         private bool IsSlewGraceActive()
         {
             long untilTicks = Interlocked.Read(ref _slewGraceUntilTicks);
@@ -1828,6 +1935,8 @@ namespace Pulsar_DomeDriver.Driver
             double azimuth;
             double slewAz;
             bool homeBeforeParkActive = _homeBeforeParkActive;
+            bool slewStarted = _slewStarted;
+            bool slewRequiresMotion = _slewRequiresMotion;
 
             lock (_pollingLock)
             {
@@ -1842,7 +1951,7 @@ namespace Pulsar_DomeDriver.Driver
             return intent switch
             {
                 DomeCommandIntent.GoHome => domeState == 0 && homeStatus,
-                DomeCommandIntent.SlewAzimuth => domeState == 0 &&
+                DomeCommandIntent.SlewAzimuth => (!slewRequiresMotion || slewStarted) && domeState == 0 &&
                     AngularDistance(azimuth, slewAz) <= _config.AzimuthTolerance,
                 DomeCommandIntent.OpenShutter => shutterStatus == 0,
                 DomeCommandIntent.CloseShutter => shutterStatus == 1,
@@ -2984,22 +3093,66 @@ namespace Pulsar_DomeDriver.Driver
             get
             {
                 // Slewing is derived from reset state, intent/grace period, and controller status.
-                if (_config.Resetting || _config.Rebooting)
-                    return true;
+                bool resetting = _config.Resetting || _config.Rebooting;
+                bool homeBeforePark = _homeBeforeParkActive;
+                bool intentActive = _lastIntent != DomeCommandIntent.None && !IsCommandComplete();
+                bool graceActive = IsSlewGraceActive();
+                bool forceBusy = _config.ForceBusy;
+                bool watchdogActive = _config.ActionWatchdogRunning;
 
-                if (_homeBeforeParkActive)
-                    return true;
-
-                if (_lastIntent != DomeCommandIntent.None && !IsCommandComplete())
-                    return true;
-
-                if (IsSlewGraceActive() || _config.ForceBusy || _config.ActionWatchdogRunning)
-                    return true;
+                int domeState;
+                short shutterStatus;
+                double azimuth;
+                double slewAz;
+                bool slewingStatusFlag;
 
                 lock (_pollingLock)
                 {
-                    return !(_config.DomeState == 0 && (_config.ShutterStatus == 0 || _config.ShutterStatus == 1));
+                    domeState = _config.DomeState;
+                    shutterStatus = _config.ShutterStatus;
+                    azimuth = _config.Azimuth;
+                    slewAz = _config.SlewAz;
+                    slewingStatusFlag = _config.SlewingStatus;
                 }
+
+                bool domeMoving = domeState != 0;
+                bool shutterMoving = shutterStatus == 2 || shutterStatus == 3;
+
+                bool result;
+                string reason;
+
+                if (resetting)
+                {
+                    result = true;
+                    reason = "reset/reboot";
+                }
+                else if (homeBeforePark)
+                {
+                    result = true;
+                    reason = "homeBeforePark";
+                }
+                else if (intentActive)
+                {
+                    result = true;
+                    reason = "intent-active";
+                }
+                else if (graceActive || forceBusy || watchdogActive)
+                {
+                    result = true;
+                    reason = "grace/force/watchdog";
+                }
+                else
+                {
+                    result = domeMoving || shutterMoving;
+                    reason = "status";
+                }
+
+                if (_lastIntent == DomeCommandIntent.SlewAzimuth || !result)
+                {
+                    SafeLog($"[SlewingCheck] result={result} reason={reason} intent={_lastIntent} reset={resetting} forceBusy={forceBusy} watchdog={watchdogActive} grace={graceActive} domeState={domeState} shutter={shutterStatus} az={azimuth:0.0} slewAz={slewAz:0.0} started={_slewStarted} requiresMotion={_slewRequiresMotion} flag={slewingStatusFlag}", LogLevel.Debug);
+                }
+
+                return result;
             }
         }
 
@@ -3037,6 +3190,23 @@ namespace Pulsar_DomeDriver.Driver
             // Guard against commands during dispose, reset, or while busy.
             if (_disposed)
                 throw new ObjectDisposedException(nameof(DomeDriver));
+
+            bool domeMoving;
+            bool shutterMoving;
+            double azimuth;
+            double slewAz;
+            int domeState;
+            short shutterStatus;
+            lock (_pollingLock)
+            {
+                domeMoving = _config.DomeState != 0;
+                shutterMoving = _config.ShutterStatus == 2 || _config.ShutterStatus == 3;
+                azimuth = _config.Azimuth;
+                slewAz = _config.SlewAz;
+                domeState = _config.DomeState;
+                shutterStatus = _config.ShutterStatus;
+            }
+            SafeLog($"EnsureReadyForCommand {actionLabel}: reset={_config.Resetting}, reboot={_config.Rebooting}, slewing={Slewing}, forceBusy={_config.ForceBusy}, watchdog={_config.ActionWatchdogRunning}, domeState={domeState}, shutterStatus={shutterStatus}, moving={domeMoving || shutterMoving}, az={azimuth:0.0}, slewAz={slewAz:0.0}", LogLevel.Debug);
 
             if (_config.Rebooting)
             {
@@ -3314,18 +3484,32 @@ namespace Pulsar_DomeDriver.Driver
                 message: message,
                 timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.OpenShutter,
-                alreadyAtTarget: () => _config.ShutterStatus == 0,
+                alreadyAtTarget: () =>
+                {
+                    lock (_pollingLock)
+                    {
+                        return _config.ShutterStatus == 0;
+                    }
+                },
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.ShutterStatus = 2; // opening
                     _config.SlewingStatus = true;
                 },
-                checkStatus: () => _config.ShutterStatus switch
+                checkStatus: () =>
                 {
-                    0 => ActionWatchdog.WatchdogResult.Success,
-                    4 => ActionWatchdog.WatchdogResult.Error,
-                    5 => ActionWatchdog.WatchdogResult.Failure,
-                    _ => ActionWatchdog.WatchdogResult.InProgress
+                    short shutterStatus;
+                    lock (_pollingLock)
+                    {
+                        shutterStatus = _config.ShutterStatus;
+                    }
+                    return shutterStatus switch
+                    {
+                        0 => ActionWatchdog.WatchdogResult.Success,
+                        4 => ActionWatchdog.WatchdogResult.Error,
+                        5 => ActionWatchdog.WatchdogResult.Failure,
+                        _ => ActionWatchdog.WatchdogResult.InProgress
+                    };
                 },
                 mqttTopic: _mqttShutterStatus,
                 mqttSuccess: "Shutter is open.",
@@ -3355,18 +3539,32 @@ namespace Pulsar_DomeDriver.Driver
                 message: message,
                 timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.CloseShutter,
-                alreadyAtTarget: () => _config.ShutterStatus == 1,
+                alreadyAtTarget: () =>
+                {
+                    lock (_pollingLock)
+                    {
+                        return _config.ShutterStatus == 1;
+                    }
+                },
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.ShutterStatus = 3; // closing
                     _config.SlewingStatus = true;
                 },
-                checkStatus: () => _config.ShutterStatus switch
+                checkStatus: () =>
                 {
-                    1 => ActionWatchdog.WatchdogResult.Success,
-                    4 => ActionWatchdog.WatchdogResult.Error,
-                    5 => ActionWatchdog.WatchdogResult.Failure,
-                    _ => ActionWatchdog.WatchdogResult.InProgress
+                    short shutterStatus;
+                    lock (_pollingLock)
+                    {
+                        shutterStatus = _config.ShutterStatus;
+                    }
+                    return shutterStatus switch
+                    {
+                        1 => ActionWatchdog.WatchdogResult.Success,
+                        4 => ActionWatchdog.WatchdogResult.Error,
+                        5 => ActionWatchdog.WatchdogResult.Failure,
+                        _ => ActionWatchdog.WatchdogResult.InProgress
+                    };
                 },
                 mqttTopic: _mqttShutterStatus,
                 mqttSuccess: "Shutter closed.",
@@ -3392,7 +3590,25 @@ namespace Pulsar_DomeDriver.Driver
                 throw new InvalidValueException($"Invalid Azimuth request of {azimuth} - must be between 0 and less than 360 degrees.");
             }
 
-            changeAzimuth = AngularDistance(azimuth, _config.Azimuth);
+            double currentAz;
+            double slewAz;
+            int domeState;
+            bool parkStatus;
+            bool slewingStatus;
+            double azimuthTolerance;
+            lock (_pollingLock)
+            {
+                currentAz = _config.Azimuth;
+                slewAz = _config.SlewAz;
+                domeState = _config.DomeState;
+                parkStatus = _config.ParkStatus;
+                slewingStatus = _config.SlewingStatus;
+                azimuthTolerance = _config.AzimuthTolerance;
+            }
+            SafeLog($"SlewToAzimuth requested: target={azimuth:0.0}, current={currentAz:0.0}, slewAz={slewAz:0.0}, domeState={domeState}, park={parkStatus}, slewing={slewingStatus}", LogLevel.Debug);
+
+            changeAzimuth = AngularDistance(azimuth, currentAz);
+            BeginSlewTracking(currentAz, azimuth, changeAzimuth, azimuthTolerance);
             string message = $"Slewing to {azimuth}...";
             string command = $"ABS {azimuth}";
             LogDome(message);
@@ -3407,7 +3623,17 @@ namespace Pulsar_DomeDriver.Driver
                 message: message,
                 timeoutMs: _config.RotationTimeout * 1000,
                 intent: DomeCommandIntent.SlewAzimuth,
-                alreadyAtTarget: () => AngularDistance(_config.Azimuth, azimuth) < _config.AzimuthTolerance,
+                alreadyAtTarget: () =>
+                {
+                    double azimuthNow;
+                    double tolerance;
+                    lock (_pollingLock)
+                    {
+                        azimuthNow = _config.Azimuth;
+                        tolerance = _config.AzimuthTolerance;
+                    }
+                    return AngularDistance(azimuthNow, azimuth) < tolerance;
+                },
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.DomeState = 1;
@@ -3415,10 +3641,21 @@ namespace Pulsar_DomeDriver.Driver
                 },
                 checkStatus: () =>
                 {
-                    if (_config.DomeState == 0 && AngularDistance(_config.Azimuth, azimuth) < _config.AzimuthTolerance)
+                    int domeState;
+                    double azimuthNow;
+                    double tolerance;
+                    lock (_pollingLock)
+                    {
+                        domeState = _config.DomeState;
+                        azimuthNow = _config.Azimuth;
+                        tolerance = _config.AzimuthTolerance;
+                    }
+                    bool canComplete = !_slewRequiresMotion || _slewStarted;
+
+                    if (canComplete && domeState == 0 && AngularDistance(azimuthNow, azimuth) < tolerance)
                         return ActionWatchdog.WatchdogResult.Success;
 
-                    if (_config.DomeState == 1 || AngularDistance(_config.Azimuth, azimuth) >= _config.AzimuthTolerance)
+                    if (!canComplete || domeState == 1 || AngularDistance(azimuthNow, azimuth) >= tolerance)
                         return ActionWatchdog.WatchdogResult.InProgress;
 
                     return ActionWatchdog.WatchdogResult.Failure;
@@ -3450,7 +3687,13 @@ namespace Pulsar_DomeDriver.Driver
                 message: message,
                 timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.GoHome,
-                alreadyAtTarget: () => _config.HomeStatus,
+                alreadyAtTarget: () =>
+                {
+                    lock (_pollingLock)
+                    {
+                        return _config.HomeStatus;
+                    }
+                },
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.DomeState = 9; // going home
@@ -3458,7 +3701,12 @@ namespace Pulsar_DomeDriver.Driver
                 },
                 checkStatus: () =>
                 {
-                    return _config.HomeStatus
+                    bool homeStatus;
+                    lock (_pollingLock)
+                    {
+                        homeStatus = _config.HomeStatus;
+                    }
+                    return homeStatus
                         ? ActionWatchdog.WatchdogResult.Success
                         : ActionWatchdog.WatchdogResult.InProgress;
                 },
@@ -3495,7 +3743,13 @@ namespace Pulsar_DomeDriver.Driver
                 message: message,
                 timeoutMs: timeoutMs,
                 intent: DomeCommandIntent.Park,
-                alreadyAtTarget: () => _config.ParkStatus,
+                alreadyAtTarget: () =>
+                {
+                    lock (_pollingLock)
+                    {
+                        return _config.ParkStatus;
+                    }
+                },
                 updateConfigBeforeWatchdog: () =>
                 {
                     _config.DomeState = 1; // moving to target (park)
@@ -3503,7 +3757,12 @@ namespace Pulsar_DomeDriver.Driver
                 },
                 checkStatus: () =>
                 {
-                    return _config.ParkStatus
+                    bool parkStatus;
+                    lock (_pollingLock)
+                    {
+                        parkStatus = _config.ParkStatus;
+                    }
+                    return parkStatus
                         ? ActionWatchdog.WatchdogResult.Success
                         : ActionWatchdog.WatchdogResult.InProgress;
                 },
@@ -3530,14 +3789,24 @@ namespace Pulsar_DomeDriver.Driver
 
                 try
                 {
-                    if (_config.ParkStatus)
+                    bool alreadyParked;
+                    lock (_pollingLock)
+                    {
+                        alreadyParked = _config.ParkStatus;
+                    }
+                    if (alreadyParked)
                     {
                         SafeLog("Already at target - skipping command and watchdog.", LogLevel.Info);
                         _config.ForceBusy = false;
                         return;
                     }
 
-                    if (!_config.HomeStatus)
+                    bool homeStatus;
+                    lock (_pollingLock)
+                    {
+                        homeStatus = _config.HomeStatus;
+                    }
+                    if (!homeStatus)
                     {
                         _homeBeforeParkActive = true;
                         SafeLog("Home-before-park enabled; sending HOME.", LogLevel.Debug);
@@ -3563,7 +3832,13 @@ namespace Pulsar_DomeDriver.Driver
                         return;
                     }
 
-                    if (!TrySendCommand("GO P", DomeCommandIntent.Park, () => _config.ParkStatus, actionLabel))
+                    if (!TrySendCommand("GO P", DomeCommandIntent.Park, () =>
+                    {
+                        lock (_pollingLock)
+                        {
+                            return _config.ParkStatus;
+                        }
+                    }, actionLabel))
                         return;
 
                     lock (_pollingLock)
@@ -3582,7 +3857,12 @@ namespace Pulsar_DomeDriver.Driver
                         longAction: "Parking...",
                         checkStatus: () =>
                         {
-                            return _config.ParkStatus
+                            bool parkStatus;
+                            lock (_pollingLock)
+                            {
+                                parkStatus = _config.ParkStatus;
+                            }
+                            return parkStatus
                                 ? ActionWatchdog.WatchdogResult.Success
                                 : ActionWatchdog.WatchdogResult.InProgress;
                         },
@@ -3630,7 +3910,13 @@ namespace Pulsar_DomeDriver.Driver
             EnterCommandGate(actionLabel);
             try
             {
-                if (!TrySendCommand("GO P", DomeCommandIntent.Park, () => _config.ParkStatus, actionLabel))
+                if (!TrySendCommand("GO P", DomeCommandIntent.Park, () =>
+                {
+                    lock (_pollingLock)
+                    {
+                        return _config.ParkStatus;
+                    }
+                }, actionLabel))
                     return;
 
                 lock (_pollingLock)
@@ -3649,7 +3935,12 @@ namespace Pulsar_DomeDriver.Driver
                     longAction: "Parking...",
                     checkStatus: () =>
                     {
-                        return _config.ParkStatus
+                        bool parkStatus;
+                        lock (_pollingLock)
+                        {
+                            parkStatus = _config.ParkStatus;
+                        }
+                        return parkStatus
                             ? ActionWatchdog.WatchdogResult.Success
                             : ActionWatchdog.WatchdogResult.InProgress;
                     },
@@ -3672,13 +3963,24 @@ namespace Pulsar_DomeDriver.Driver
         private bool WaitForHomeReached(int timeoutMs)
         {
             int waitedMs = 0;
-            while (!_disposed && !_config.HomeStatus && waitedMs < timeoutMs)
+            while (!_disposed && waitedMs < timeoutMs)
             {
+                bool homeStatus;
+                lock (_pollingLock)
+                {
+                    homeStatus = _config.HomeStatus;
+                }
+                if (homeStatus)
+                    break;
+
                 Thread.Sleep(_config.pollingIntervalMs);
                 waitedMs += _config.pollingIntervalMs;
             }
 
-            return _config.HomeStatus;
+            lock (_pollingLock)
+            {
+                return _config.HomeStatus;
+            }
         }
 
         public void AbortSlew()
@@ -3711,12 +4013,14 @@ namespace Pulsar_DomeDriver.Driver
                     {
                         _config.SlewingStatus = false; // let poller confirm DomeState
                     }
+                    _config.ForceBusy = false;
                     ClearSlewGracePeriod();
 
                     CancelCurrentActionWatchdog(suppressReset: true);
 
                     _config.ActionWatchdogRunning = false;
                     _lastIntent = DomeCommandIntent.None;
+                    ClearSlewTracking();
 
                     _GNS.SendGNS(GNSType.Cease, "Abort succeeded.");
                     TryMQTTPublish(_mqttDomeStatus, "Abort succeeded");

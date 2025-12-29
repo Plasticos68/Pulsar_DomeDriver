@@ -17,7 +17,7 @@ namespace Pulsar_DomeDriver.Helper
         private readonly string _mqttTopic;
         private readonly string _mqttSuccess;
         private readonly string _mqttFail;
-        private readonly string _mqttFailTopic = "Alarm";
+        private readonly string _mqttFailTopic;
 
         private readonly Func<Task> _resetRoutine;
         private readonly Func<WatchdogResult> _checkStatus;
@@ -51,7 +51,8 @@ namespace Pulsar_DomeDriver.Helper
             MqttPublisher mqttPublisher = null,
             string mqttTopic = null,
             string mqttSuccess = null,
-            string mqttFail = null
+            string mqttFail = null,
+            string mqttFailTopic = null
         )
         {
             _config = config;
@@ -63,6 +64,7 @@ namespace Pulsar_DomeDriver.Helper
             _mqttTopic = mqttTopic;
             _mqttSuccess = mqttSuccess;
             _mqttFail = mqttFail;
+            _mqttFailTopic = string.IsNullOrWhiteSpace(mqttFailTopic) ? mqttTopic : mqttFailTopic;
             _resetRoutine = resetRoutine;
             _checkStatus = checkStatus;
             _tcs = new TaskCompletionSource<WatchdogResult>(TaskCreationOptions.RunContinuationsAsynchronously);

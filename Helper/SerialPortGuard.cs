@@ -51,8 +51,19 @@ namespace Pulsar_DomeDriver.Helper
                 throw new ArgumentException("Command cannot be null or empty.");
             }
 
+            bool gateAcquired = false;
+            bool busySet = false;
+
             SafeLog($"Waiting for serial gate to send: {command}", LogLevel.Debug);
-            _gate.Wait();
+            try
+            {
+                _gate.Wait();
+                gateAcquired = true;
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ASCOM.NotConnectedException("Serial port was disposed.");
+            }
             SafeLog($"Serial gate acquired for: {command}", LogLevel.Trace);
 
             try
@@ -63,6 +74,7 @@ namespace Pulsar_DomeDriver.Helper
                         throw new ObjectDisposedException(nameof(SerialPortGuard));
 
                     _setBusy?.Invoke();
+                    busySet = true;
 
                     if (_port == null || !_port.IsOpen)
                         throw new ASCOM.NotConnectedException("Serial port is not open.");
@@ -151,8 +163,14 @@ namespace Pulsar_DomeDriver.Helper
             }
             finally
             {
-                _clearBusy?.Invoke();
-                _gate.Release();
+                if (busySet)
+                {
+                    _clearBusy?.Invoke();
+                }
+                if (gateAcquired)
+                {
+                    try { _gate.Release(); } catch (ObjectDisposedException) { }
+                }
             }
         }
 
@@ -167,7 +185,17 @@ namespace Pulsar_DomeDriver.Helper
                 throw new ArgumentException("Command cannot be null or empty.");
             }
 
-            await _gate.WaitAsync();
+            bool gateAcquired = false;
+            bool busySet = false;
+            try
+            {
+                await _gate.WaitAsync();
+                gateAcquired = true;
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ASCOM.NotConnectedException("Serial port was disposed.");
+            }
 
             try
             {
@@ -177,6 +205,7 @@ namespace Pulsar_DomeDriver.Helper
                         throw new ObjectDisposedException(nameof(SerialPortGuard));
 
                     _setBusy?.Invoke();
+                    busySet = true;
 
                     if (_port == null || !_port.IsOpen)
                         throw new ASCOM.NotConnectedException("Serial port is not open.");
@@ -195,8 +224,14 @@ namespace Pulsar_DomeDriver.Helper
             }
             finally
             {
-                _clearBusy?.Invoke();
-                _gate.Release();
+                if (busySet)
+                {
+                    _clearBusy?.Invoke();
+                }
+                if (gateAcquired)
+                {
+                    try { _gate.Release(); } catch (ObjectDisposedException) { }
+                }
             }
         }
 
